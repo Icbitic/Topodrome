@@ -1,0 +1,139 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "topodrome"
+version = "0.1.0"
+description = "A scheduler and execution plane for heterogeneous research GPU sites"
+readme = "README.md"
+requires-python = ">=3.11,<3.13"
+license = { text = "MIT" }
+authors = [{ name = "Topodrome maintainers" }]
+dependencies = [
+  "anyio>=4.8",
+  "httpx>=0.28",
+  "pydantic>=2.10",
+  "pydantic-settings>=2.7",
+  "pyyaml>=6.0.2",
+  "structlog>=25.1",
+  "tenacity>=9.0",
+  "typer>=0.15",
+]
+
+[project.optional-dependencies]
+scheduler = [
+  "alembic>=1.14",
+  "asyncpg>=0.30",
+  "fastapi>=0.115",
+  "sqlalchemy[asyncio]>=2.0.37",
+  "uvicorn[standard]>=0.34",
+  "websockets>=14.1",
+]
+agent = [
+  "aiosqlite>=0.20",
+  "nvidia-ml-py>=12.560",
+  "psutil>=6.1",
+  "websockets>=14.1",
+]
+runtime = [
+  "accelerate>=1.2",
+  "ray[default]>=2.40",
+  "safetensors>=0.5",
+  "torch>=2.7",
+  "transformers>=4.48,<5",
+]
+jupyter = [
+  "ipykernel>=6.29",
+  "jupyter-client>=8.6",
+  "jupyter-server>=2.15,<3",
+  "websockets>=14.1",
+]
+ui = [
+    "textual>=6,<9",
+]
+
+[project.scripts]
+topodrome = "topodrome.client.cli:app"
+topodrome-scheduler = "topodrome.scheduler.main:main"
+topodrome-agent = "topodrome.site_agent.app:main"
+topodrome-build-autodl-bootstrap = "topodrome.deployment.autodl:main"
+topodrome-jupyter-agent-bootstrap = "topodrome.deployment.jupyter_agent:main"
+topodrome-managed-jupyter = "topodrome.jupyter.managed_server:main"
+
+[dependency-groups]
+dev = [
+  "aiosqlite>=0.20",
+  "alembic>=1.14",
+  "asgi-lifespan>=2.1",
+  "asyncpg>=0.30",
+  "fastapi>=0.115",
+  "hypothesis>=6.124",
+  "mypy>=1.14",
+  "pytest>=8.3",
+  "pytest-asyncio>=0.25",
+  "pytest-cov>=6.0",
+  "pytest-socket>=0.7",
+  "respx>=0.22",
+  "ruff>=0.9",
+  "sqlalchemy[asyncio]>=2.0.37",
+  "time-machine>=2.16",
+  "types-pyyaml>=6.0.12",
+  "uvicorn[standard]>=0.34",
+  "websockets>=14.1",
+  "jupyter-client>=8.6",
+  "jupyter-server>=2.15,<3",
+  "asyncssh>=2.21",
+  "textual>=6,<9",
+]
+postgres = [
+  "pgserver==0.1.4",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/topodrome"]
+
+[tool.pytest.ini_options]
+addopts = "-ra --strict-config --strict-markers"
+asyncio_mode = "auto"
+pythonpath = ["."]
+testpaths = ["tests"]
+markers = [
+  "unit: hermetic unit tests",
+  "component: in-process component tests",
+  "postgres: requires a real PostgreSQL server",
+  "ray: requires a local Ray cluster",
+  "gpu: requires an admitted CUDA GPU",
+  "remote: reaches a configured remote site",
+  "provider: may mutate paid provider capacity",
+  "slow: takes longer than the default suite",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "ASYNC", "S", "RUF"]
+ignore = ["S101"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+warn_unused_ignores = true
+plugins = ["pydantic.mypy"]
+
+[tool.coverage.run]
+branch = true
+source = ["topodrome"]
+
+[tool.uv]
+default-groups = ["dev"]
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu128" }

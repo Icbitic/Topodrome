@@ -1,0 +1,57 @@
+site_id: autodl
+display_name: AutoDL
+# The worker reaches the scheduler's loopback listener through the owned
+# outbound SSH forward below. The release builder requires an exact endpoint
+# match, so a paid boot cannot start with an unusable callback route.
+scheduler_url: http://127.0.0.1:18042
+# Required: inject the scheduler's stable signing key with
+# TOPODROME_SITE_FENCE_VERIFICATION_KEY from protected regional storage.
+site_kind: autodl
+# Inject the current provider UUID as TOPODROME_SITE_PROVIDER_INSTANCE_ID when
+# bootstrapping a recreated instance. With Topodrome's single-retained-instance
+# policy, the fixed site_id below is also a safe durable association key. A
+# multi-GPU heartbeat is accepted only when it reports every GPU requested for
+# that one provider instance.
+# AutoDL's global namespace is an ephemeral local mirror. Only regional model,
+# bootstrap, and agent state belongs under /root/autodl-fs.
+global_root: /root/autodl-tmp/topodrome-global
+scratch_root: /root/autodl-tmp/topodrome
+ray_short_temp_root: /tmp
+persistent_root: /root/autodl-fs/topodrome
+spool_path: /root/autodl-fs/topodrome/agent-spool.sqlite3
+heartbeat_interval_seconds: 5
+gpu_safety_margin_gb: 1
+cancellation_grace_seconds: 30
+# The bootstrap builder embeds the selected catalog as config/models.yaml and
+# rewrites this field inside the generated release.
+model_config: configs/models.example.yaml
+ssh_local_forward:
+  # Create this dedicated key on the AutoDL regional filesystem. Never copy a
+  # personal or Lab1 login private key onto replaceable provider compute.
+  identity_file: /root/autodl-fs/topodrome/secrets/control_ed25519
+  known_hosts_file: /root/autodl-fs/topodrome/secrets/lab1_known_hosts
+  remote_host: 111.127.53.162
+  remote_user: xiangkun
+  remote_port: 2201
+  local_host: 127.0.0.1
+  local_port: 18042
+  target_host: 127.0.0.1
+  target_port: 8042
+  state_directory: /root/autodl-tmp/topodrome/control-tunnel
+  ssh_executable: /usr/bin/ssh
+  startup_timeout_seconds: 30
+  shutdown_timeout_seconds: 10
+rclone:
+  verification_via_scheduler: true
+  # Direct SFTP mirroring avoids a FUSE dependency on replaceable workers.
+  mode: mirror
+  mountpoint: /root/autodl-tmp/topodrome-global
+  remote: 'lab1-global:'
+  # Required for mount-mode compatibility; direct mirror mode does not use it.
+  cache_dir: /root/autodl-tmp/rclone-vfs-cache
+  # The generated release supplies this credential-free executable on PATH.
+  binary: rclone
+  min_free_space_gb: 10
+  poll_interval_seconds: 5
+  verification_timeout_seconds: 120
+  transfer_timeout_seconds: 21600

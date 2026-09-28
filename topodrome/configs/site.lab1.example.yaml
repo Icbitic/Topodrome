@@ -1,0 +1,35 @@
+site_id: lab1
+display_name: Lab1
+scheduler_url: http://127.0.0.1:8042
+# Required: inject the scheduler's stable signing key with
+# TOPODROME_SITE_FENCE_VERIFICATION_KEY.
+site_kind: lab
+allowed_gpu_indices: [0, 1, 2, 3, 4, 5, 6, 7]
+global_root: /srv/topodrome
+scratch_root: /ssd/topodrome-scratch
+# Ray data stays under scratch_root. If that path is too long for Linux AF_UNIX
+# sockets, the agent creates a private checked symlink below this short root.
+ray_short_temp_root: /tmp
+spool_path: /var/lib/topodrome/agent-spool.sqlite3
+heartbeat_interval_seconds: 5
+gpu_safety_margin_gb: 1
+# Explicit cancellation is cooperative for this long, then exact-owned actors
+# are force-stopped. Job checkpoint settings cannot extend this bound.
+cancellation_grace_seconds: 30
+allow_foreign_processes_when_capacity_sufficient: true
+# Shared deployments delegate contention shedding to the central queue-aware
+# policy so the five-occupied-GPU threshold and queue-time warm floor are
+# enforced globally. Keep the independent local policy for standalone sites.
+idle_actor_rebalance_enabled: false
+idle_actor_rebalance_cooldown_seconds: 300
+# Global actor retention, replacement, and the 20-minute excess-idle timeout
+# are scheduler policy so they can preserve the queue-active cross-site floor.
+# Keep the legacy independent site-local reaper disabled in this deployment.
+warm_actor_idle_timeout_seconds: null
+# Keep this aligned with scheduling.light_contention_utilization_percent.
+light_contention_utilization_percent: 10
+model_config: configs/models.example.yaml
+# Secure default: hash every preseeded model file before advertising it. Set
+# false only when this site's model tree is trusted, immutable, and provisioned
+# out of band; downloaded and locally staged models are still fully verified.
+verify_preseeded_model_hashes: true

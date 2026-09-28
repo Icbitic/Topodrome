@@ -1,0 +1,11 @@
+"""Versioned on-disk layout for immutable source bundles."""
+
+SOURCE_BUNDLE_FORMAT_VERSION = 2
+SOURCE_BUNDLE_METADATA_DIRECTORY = ".topodrome"
+SOURCE_BUNDLE_MANIFEST_NAME = "manifest.json"
+
+__all__ = [
+    "SOURCE_BUNDLE_FORMAT_VERSION",
+    "SOURCE_BUNDLE_MANIFEST_NAME",
+    "SOURCE_BUNDLE_METADATA_DIRECTORY",
+]

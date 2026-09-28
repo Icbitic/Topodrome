@@ -1,0 +1,136 @@
+database_dsn: postgresql+asyncpg://topodrome@127.0.0.1/topodrome
+api_host: 127.0.0.1
+api_port: 8042
+public_url: https://topodrome.lab1.example
+# Production must disable loopback-only development mode and inject a non-empty
+# TOPODROME_API_TOKEN. The built-in plaintext listener always requires loopback;
+# publish the configured HTTPS origin through a TLS reverse proxy.
+insecure_development_mode: false
+global_root: /srv/topodrome
+heartbeat_ttl_seconds: 30
+offer_ttl_seconds: 30
+lease_ttl_seconds: 90
+fencing_token_ttl_seconds: 10800
+dispatch_interval_seconds: 1
+kernel_connect_ttl_seconds: 300
+kernel_operation_timeout_seconds: 120
+kernel_max_request_bytes: 262144
+kernel_max_output_bytes: 262144
+kernel_request_cache_size: 256
+# Required: inject a stable value with TOPODROME_FENCE_SIGNING_KEY. Rotating or
+# regenerating it on scheduler restart would invalidate in-flight assignments.
+secret_file: /home/xiangkun/.config/topodrome/secrets.env
+model_config: configs/models.example.yaml
+# Explicit fast-GPU policy for free institutional sites. Lab1 and the configured
+# Jupyter site currently report this exact A800 name. Empty remains the safe
+# fallback for other deployments: every otherwise-eligible institutional GPU
+# then blocks paid capacity.
+scheduling:
+  prefer_autodl_over_foreign_processes: true
+  # Before GPU admission only: reconsider input placement using recent measured
+  # download/startup costs. Both savings thresholds apply; cooldown limits churn.
+  input_placement:
+    enabled: true
+    min_saving_seconds: 30
+    min_saving_fraction: 0.2
+    cooldown_seconds: 60
+    history_max_age_seconds: 604800
+    default_download_mib_per_second: 1
+    local_read_mib_per_second: 512
+    preparation_overhead_seconds: 5
+  fast_gpu_name_patterns:
+    - '^NVIDIA A800-SXM4-80GB$'
+  # Convert site-reported queue depth to estimated wait time before comparing
+  # the per-site model cold-start estimates in models.example.yaml.
+  queue_delay_seconds_per_job: 30
+  # Sharing is "light" only with at least two complete requested VRAM
+  # footprints free per selected GPU and utilization at or below this value.
+  # AutoDL ranks ahead of heavier foreign-process contention.
+  light_contention_utilization_percent: 10
+  # Recheck compatible on-demand startup at this interval. Confirmed provider
+  # unavailability falls back to a heavily contended institutional GPU.
+  # A blocking foreign CUDA process makes a GPU scheduler-ineligible by
+  # default. Opt in only sites whose agent is also configured to admit safely
+  # alongside foreign allocations. Both institutional sites in this shared
+  # deployment recheck physical free VRAM plus their own safety margin.
+  foreign_capacity_sharing_site_ids:
+    - lab1
+    - remote-jupyter-1
+  # Warm-actor lifecycle is a reloadable scheduler policy. Counts refer to
+  # physical GPU memberships, so one two-GPU sharded actor counts as two.
+  actor_policy_enabled: true
+  # While runnable work is queued, retain at least one Topodrome actor GPU
+  # across the institutional fabric. With no queued demand the pool may reach
+  # zero after the idle timeout. The retained actor is model-agnostic: demand
+  # may atomically replace an idle Llama actor with Gemma, or combine two idle
+  # single-GPU actors into a leased two-GPU model replica.
+  institutional_actor_floor_gpu_count: 1
+  # Early shedding of a warm actor that now shares with blocking foreign CUDA
+  # work starts only once Topodrome occupies at least five institutional GPUs.
+  contended_actor_shedding_threshold_gpu_count: 5
+  # Require a stable observation and limit maintenance to one decision per
+  # cooldown window to avoid reacting to transient NVML samples.
+  actor_policy_stability_seconds: 30
+  actor_policy_cooldown_seconds: 300
+  # Release idle Lab/Jupyter actors after 20 minutes, preserving the floor only
+  # while work is queued. Active batch jobs and interactive kernels are never
+  # maintenance candidates.
+  institutional_warm_actor_idle_timeout_seconds: 1200
+  # Admission limits are discovered by current clients before packaging and
+  # participate in the same drain-safe `topodrome policy-reload`. The hard
+  # implementation ceilings are 256 MiB/file and 1 GiB total.
+  source_limits:
+    max_files: 1024
+    max_path_chars: 500
+    max_file_bytes: 268435456
+    max_total_bytes: 1073741824
+user_access:
+  # Optional per-Unix-account access to the loopback API. The owner-only JSON
+  # store contains only random bearer-token digests and is the live whitelist;
+  # `topodrome user-grant USER` adds or rotates one existing server account.
+  enabled: true
+  credential_store_path: /home/xiangkun/.config/topodrome/users.json
+  require_local_account: true
+jupyter_bootstrap:
+  # Disabled unless this scheduler must recover a terminal-only outbound site.
+  enabled: false
+  site_id: remote-jupyter-1
+  # Install this same uv-locked Topodrome release on the remote site. This
+  # static command contains no URL or token: the packaged wrapper reads the
+  # owner-only files locally, starts exactly one detached agent generation,
+  # and prints the marker only after local construction and stabilization.
+  command: topodrome-jupyter-agent-bootstrap --config /home/jovyan/.config/topodrome/site.yaml --site-env-file /home/jovyan/.config/topodrome/site.env
+  ready_marker: TOPODROME_AGENT_READY
+  attempt_timeout_seconds: 90
+  initial_retry_seconds: 5
+  max_retry_seconds: 300
+managed_jupyter:
+  # Opt-in stock Jupyter Server bridge for PyCharm and other IDE clients.
+  # Requires TOPODROME_MANAGED_JUPYTER_SERVER_TOKEN in the protected secret file.
+  enabled: false
+  # This hardened stock-server entry point suppresses token-bearing discovery
+  # metadata and disables local terminals while retaining normal IDE APIs.
+  executable: topodrome-managed-jupyter
+  bind_host: 127.0.0.1
+  # The plaintext listener must remain on loopback. In production, publish these
+  # ports through an authenticated TLS reverse proxy.
+  public_url_template: https://notebooks.lab1.example:{port}
+  notebooks_root: /srv/topodrome/notebooks
+  runtime_root: /srv/topodrome/.topodrome-jupyter-runtime
+  port_start: 8888
+  port_end: 8999
+  max_servers: 8
+  startup_timeout_seconds: 30
+  shutdown_timeout_seconds: 10
+  idle_timeout_seconds: 1800
+autodl:
+  # Rent externally, then register the SSH endpoint with Topodrome.
+  manual_ssh: false
+  manual_state_dir: /home/xiangkun/.config/topodrome/manual-autodl
+  manual_bootstrap_dir: /ssd/xiangkun/.local/share/topodrome/autodl-manual-bootstrap
+  site_id: autodl
+  idle_timeout_seconds: 300
+  reconcile_interval_seconds: 15
+  drain_timeout_seconds: 120
+  startup_heartbeat_timeout_seconds: 1800
+  manual_offline_unregister_seconds: 600

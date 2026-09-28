@@ -1,0 +1,19 @@
+source_dir: .
+entrypoint: model_summary.py
+model:
+  alias: meta-llama-3-8b-instruct
+  parallelism:
+    mode: model_sharded
+    degree: 2
+    engine: transformers_device_map
+    strategy: balanced
+    max_memory_gb_per_gpu: 10
+resources:
+  gpu: 2
+  min_vram_gb: 11
+kwargs:
+  label: topodrome-sharded-example
+required_outputs:
+  - model-summary.json
+retry:
+  max_attempts: 2

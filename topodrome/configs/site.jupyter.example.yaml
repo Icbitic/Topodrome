@@ -1,0 +1,71 @@
+site_id: remote-jupyter-1
+display_name: Remote JupyterLab
+# Install this project from its exact uv.lock on the Jupyter host, copy this
+# file to ~/.config/topodrome/site.yaml, and protect both that directory (0700)
+# and file (0600). Put site-only environment values in an adjacent mode-0600
+# site.env; never place the Jupyter management or AutoDL provider token there.
+# Central Lab1 scheduler endpoint. The JupyterLab Terminal API URL is used only
+# by the protected bootstrap adapter and must not be configured as control URL.
+scheduler_url: https://lab1-scheduler.internal:8042
+# Required: inject the scheduler's stable signing key with
+# TOPODROME_SITE_FENCE_VERIFICATION_KEY.
+site_kind: jupyter
+# The terminal bootstrap discovers the server's actual GPU indexes and starts
+# an outbound Topodrome agent; no inbound Ray port is opened.
+allowed_gpu_indices: null
+# In mirror mode this is a site-local cache of Lab1's authoritative namespace,
+# not an independent global filesystem. It must equal rclone.mountpoint below.
+global_root: /home/dpsk_a2a/.cache/topodrome/global
+scratch_root: /tmp/topodrome-scratch
+ray_short_temp_root: /tmp
+spool_path: /tmp/topodrome-agent-spool.sqlite3
+heartbeat_interval_seconds: 5
+gpu_safety_margin_gb: 5
+cancellation_grace_seconds: 30
+# This shared institutional host admits alongside foreign workloads only when
+# the current physical free VRAM still covers the request plus the configured
+# safety margin. Sustained pressure after admission triggers graceful
+# preemption; Topodrome never signals the foreign process.
+allow_foreign_processes_when_capacity_sufficient: true
+# Shared deployments delegate contention shedding to the central queue-aware
+# policy so the five-occupied-GPU threshold and queue-time warm floor are
+# enforced globally. Keep the independent local policy for standalone sites.
+idle_actor_rebalance_enabled: false
+idle_actor_rebalance_cooldown_seconds: 300
+# Global actor retention, replacement, and the 20-minute excess-idle timeout
+# are scheduler policy so they can preserve the queue-active cross-site floor.
+# Keep the legacy independent site-local reaper disabled in this deployment.
+warm_actor_idle_timeout_seconds: null
+# Keep this aligned with scheduling.light_contention_utilization_percent.
+light_contention_utilization_percent: 10
+# Match only a direct Python invocation whose script basename is exactly
+# gpu_idle_load.py. Matching processes may self-yield; Topodrome never signals
+# them, and admission fails if they do not exit after the owned CUDA sentinel
+# appears.
+cooperative_process_patterns:
+  - '^(?:\S*/)?python(?:3(?:\.\d+)?)?(?:\s+-u)?\s+(?:\S*/)?gpu_idle_load\.py(?:\s|$)'
+cooperative_exit_timeout_seconds: 10
+# Leave gpu_reservation_lock_dir unset in the shared deployment. Other
+# launchers' advisory lock files do not create Topodrome reservations; only a
+# Topodrome lease is a hard reservation. Operators may opt into a trusted
+# external lock protocol by setting the directory explicitly.
+model_config: /home/dpsk_a2a/.config/topodrome/models.yaml
+# Secure default: hash every preseeded model file before advertising it. Set
+# false only when this site's model tree is trusted, immutable, and provisioned
+# out of band; downloaded and locally staged models are still fully verified.
+verify_preseeded_model_hashes: true
+# Direct rclone/SFTP mirroring needs no FUSE. The named remote is rooted at the
+# exact Lab1 global directory by its forced SFTP server; credentials and pinned
+# host keys live only in the owner-only rclone.conf named by RCLONE_CONFIG.
+rclone:
+  verification_via_scheduler: true
+  mode: mirror
+  mountpoint: /home/dpsk_a2a/.cache/topodrome/global
+  remote: 'lab1-global:'
+  # Required for mount-mode compatibility; direct mirror mode does not use it.
+  cache_dir: /tmp/topodrome-rclone-vfs-cache
+  binary: rclone
+  min_free_space_gb: 10
+  poll_interval_seconds: 5
+  verification_timeout_seconds: 120
+  transfer_timeout_seconds: 21600

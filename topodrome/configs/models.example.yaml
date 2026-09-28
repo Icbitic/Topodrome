@@ -1,0 +1,92 @@
+models:
+  meta-llama-3-70b-instruct:
+    revision: 50fd307e57011801c7833c87efa1984ddf2db42f
+    backend: transformers
+    backend_version: configured
+    dtype: bfloat16
+    min_vram_gb: 70
+    sites:
+      lab1:
+        path: /ssd/models/Meta-Llama-3-70B-Instruct
+        local_files_only: true
+        estimated_startup_seconds: 18
+
+  # Parallelism is deliberately a per-job setting, not a catalog default.
+  # See examples/model_summary_sharded.yaml for one reusable Transformers
+  # replica spread across an ordered, atomically leased two-GPU gang.
+  meta-llama-3-8b-instruct:
+    revision: 8afb486c1db24fe5011ec46dfbe5b5dccdb575c2
+    backend: transformers
+    backend_version: 4.57.6
+    dtype: bfloat16
+    min_vram_gb: 15
+    sites:
+      lab1:
+        path: /ssd/models/Meta-Llama-3-8B-Instruct
+        local_files_only: true
+        # Calibrate accepted-to-ready time for this exact site/model pair.
+        estimated_startup_seconds: 2
+      remote-jupyter-1:
+        path: /mnt/model/ckpts/Meta-Llama-3-8B-Instruct
+        revision_manifest: /absolute/operator-owned/model-revisions/meta-llama-3-8b-instruct.json
+        local_files_only: true
+        estimated_startup_seconds: 120
+      autodl:
+        origin: meta-llama/Meta-Llama-3-8B-Instruct
+        persistent_path: /root/autodl-fs/models/Meta-Llama-3-8B-Instruct
+        local_path: /root/autodl-tmp/models/Meta-Llama-3-8B-Instruct
+        endpoint: https://hf-mirror.com
+        estimated_startup_seconds: 30
+        exclude:
+          - original/*
+
+  gemma-3-12b-it:
+    revision: 96b6f1eccf38110c56df3a15bffe176da04bfd80
+    backend: transformers
+    backend_version: 4.57.6
+    dtype: bfloat16
+    min_vram_gb: 24
+    sites:
+      lab1:
+        path: /ssd/models/gemma-3-12b-it
+        local_files_only: true
+        estimated_startup_seconds: 3
+      remote-jupyter-1:
+        path: /mnt/model/ckpts/gemma-3-12b-it
+        revision_manifest: /absolute/operator-owned/model-revisions/gemma-3-12b-it.json
+        local_files_only: true
+        estimated_startup_seconds: 180
+
+  olmo-2-1124-7b-instruct:
+    revision: 470b1fba1ae01581f270116362ee4aa1b97f4c84
+    backend: transformers
+    backend_version: 4.57.6
+    dtype: bfloat16
+    min_vram_gb: 14
+    sites:
+      lab1:
+        path: /ssd/models/OLMo-2-1124-7B-Instruct
+        local_files_only: true
+        estimated_startup_seconds: 2
+      remote-jupyter-1:
+        path: /mnt/model/ckpts/OLMo-2-1124-7B-Instruct
+        revision_manifest: /absolute/operator-owned/model-revisions/olmo-2-1124-7b-instruct.json
+        local_files_only: true
+        estimated_startup_seconds: 110
+
+  qwen3-4b-instruct-2507:
+    revision: cdbee75f17c01a7cc42f958dc650907174af0554
+    backend: transformers
+    backend_version: 4.57.6
+    dtype: bfloat16
+    min_vram_gb: 8
+    sites:
+      lab1:
+        path: /ssd/models/Qwen3-4B-Instruct-2507
+        local_files_only: true
+        estimated_startup_seconds: 1
+      remote-jupyter-1:
+        path: /mnt/model/ckpts/Qwen3-4B-Instruct-2507
+        revision_manifest: /absolute/operator-owned/model-revisions/qwen3-4b-instruct-2507.json
+        local_files_only: true
+        estimated_startup_seconds: 60

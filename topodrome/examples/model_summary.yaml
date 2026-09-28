@@ -1,0 +1,12 @@
+source_dir: .
+entrypoint: model_summary.py
+model: meta-llama-3-8b-instruct
+resources:
+  gpu: 1
+  min_vram_gb: 15
+kwargs:
+  label: topodrome-example
+required_outputs:
+  - model-summary.json
+retry:
+  max_attempts: 2

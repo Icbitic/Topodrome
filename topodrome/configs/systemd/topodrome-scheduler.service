@@ -1,0 +1,24 @@
+[Unit]
+Description=Topodrome central scheduler
+Requires=topodrome-postgres.service topodrome-migrate.service
+After=topodrome-postgres.service topodrome-migrate.service network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/ssd/xiangkun/Topodrome/topodrome
+EnvironmentFile=/home/xiangkun/.config/topodrome/scheduler.env
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/ssd/xiangkun/Topodrome/topodrome/.venv/bin/topodrome-scheduler --config /home/xiangkun/.config/topodrome/scheduler.yaml
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=120
+# Managed stock Jupyter servers are deliberately detached and recovered by
+# exact PID/start identity after a scheduler restart. Killing the whole unit
+# cgroup would destroy that state before the replacement scheduler can adopt it.
+KillMode=process
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=default.target
