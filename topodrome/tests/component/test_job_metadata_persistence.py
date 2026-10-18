@@ -8,7 +8,7 @@ from topodrome.domain.specs import JobSpec
 @pytest.mark.asyncio
 async def test_legacy_idempotency_and_metadata_conflict(database):
     repository = SchedulerRepository()
-    spec = JobSpec(entrypoint="run.py", model="llama")
+    spec = JobSpec(entrypoint="run.py", model="test/llama")
     async with database.session() as session:
         job = await repository.submit_job(session, spec, idempotency_key="legacy")
         job.spec = {

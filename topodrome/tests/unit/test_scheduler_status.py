@@ -30,7 +30,7 @@ from topodrome.scheduler.status import system_status_snapshot
 @pytest.mark.asyncio
 async def test_status_limits_do_not_hide_active_work(database: Database) -> None:
     now = datetime.now(UTC)
-    spec = JobSpec(entrypoint="run.py", model="model").model_dump(mode="json")
+    spec = JobSpec(entrypoint="run.py", model="test/model").model_dump(mode="json")
     async with database.transaction() as session:
         for i, state in enumerate(
             (
@@ -69,7 +69,7 @@ async def test_status_snapshot_reports_owners_and_sanitizes_provider_metadata(
     spec = JobSpec(
         entrypoint="experiment.py",
         source_ref=f"sha256:{'a' * 64}",
-        model={"alias": "model", "revision": "rev"},
+        model={"repo_id": "test/model", "revision": "rev"},
         resources={"gpu": 1, "min_vram_gb": 15},
     )
     heartbeat = SiteHeartbeat(
@@ -91,7 +91,7 @@ async def test_status_snapshot_reports_owners_and_sanitizes_provider_metadata(
         ),
         models=(
             ModelCapability(
-                alias="model",
+                repo_id="test/model",
                 revision="rev",
                 backend="transformers",
                 backend_version="configured",
@@ -194,7 +194,7 @@ async def test_status_snapshot_reports_owners_and_sanitizes_provider_metadata(
         "state": "assigning",
         "site_id": "lab1",
         "gpu_count": 1,
-        "model": "model",
+        "model": "test/model",
         "workload_kind": "batch",
         "estimated_runtime_seconds": None,
         "created_at": snapshot["jobs"][0]["created_at"],

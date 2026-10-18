@@ -11,6 +11,20 @@ from topodrome.storage.base import AuthoritativeDigestReader, ObjectDigest, Stor
 from topodrome.storage.paths import normalize_logical_path
 
 
+def storage_api_origin(scheduler_url: str) -> str:
+    parsed = urlsplit(scheduler_url)
+    path = parsed.path.rstrip("/").removesuffix("/api/v1/agents/control")
+    return urlunsplit(
+        (
+            {"ws": "http", "wss": "https"}.get(parsed.scheme, parsed.scheme),
+            parsed.netloc,
+            path + "/api/v1/agents/storage",
+            "",
+            "",
+        )
+    )
+
+
 class DigestResponse(BaseModel):
     model_config = ConfigDict(strict=True, extra="forbid")
     size_bytes: int = Field(ge=0)
@@ -30,38 +44,43 @@ class SchedulerDigestReader:
         timeout: float = 120,
         transport: httpx.BaseTransport | None = None,
     ) -> None:
-        parsed = urlsplit(scheduler_url)
-        path = parsed.path.rstrip("/").removesuffix("/api/v1/agents/control")
-        self._url = urlunsplit(
-            (
-                {"ws": "http", "wss": "https"}.get(parsed.scheme, parsed.scheme),
-                parsed.netloc,
-                path + "/api/v1/agents/storage/digest",
-                "",
-                "",
-            )
-        )
+        self._url = storage_api_origin(scheduler_url) + "/digest"
         self._site_id = site_id
         self._token = token
-        self._timeout = timeout
-        self._transport = transport
+        # A client is thread-safe and reconnects after a broken keepalive. Do
+        # not recreate its TCP/SSH channel for every digest or upload claim.
+        self._client = httpx.Client(
+            timeout=timeout,
+            trust_env=False,
+            transport=transport,
+            follow_redirects=False,
+            limits=httpx.Limits(
+                max_connections=4, max_keepalive_connections=4, keepalive_expiry=None
+            ),
+        )
         self._health_reader = health_reader
 
+    def close(self) -> None:
+        self._client.close()
+
     def healthcheck(self) -> bool:
-        # Transport health is probed separately by the rclone adapter.
+        # Transport health is probed separately by the HTTP mirror.
         return self._health_reader.healthcheck()
 
     def claim_blob(self, job_id: str, attempt_id: str, digest: ObjectDigest) -> None:
         try:
-            with httpx.Client(timeout=self._timeout, trust_env=False,
-                              transport=self._transport, follow_redirects=False) as client:
-                response = client.post(
-                    self._url.removesuffix("digest") + "blobs/claim",
-                    headers={"Authorization": f"Bearer {self._token}"},
-                    json={"site_id": self._site_id, "job_id": job_id,
-                          "attempt_id": attempt_id, "sha256": digest.sha256,
-                          "size_bytes": digest.size_bytes},
-                )
+            with self._client.stream(
+                "POST",
+                self._url.removesuffix("digest") + "blobs/claim",
+                headers={"Authorization": f"Bearer {self._token}"},
+                json={
+                    "site_id": self._site_id,
+                    "job_id": job_id,
+                    "attempt_id": attempt_id,
+                    "sha256": digest.sha256,
+                    "size_bytes": digest.size_bytes,
+                },
+            ) as response:
                 response.raise_for_status()
         except httpx.HTTPError as exc:
             raise StorageUnavailableError("blob upload claim rejected or unavailable") from exc
@@ -69,23 +88,21 @@ class SchedulerDigestReader:
     def digest(self, logical_path: str) -> ObjectDigest | None:
         path = normalize_logical_path(logical_path)
         try:
-            with httpx.Client(
-                timeout=self._timeout,
-                trust_env=False,
-                transport=self._transport,
-                follow_redirects=False,
-            ) as client:
-                response = client.post(
-                    self._url,
-                    headers={"Authorization": f"Bearer {self._token}"},
-                    json={"site_id": self._site_id, "logical_path": path},
-                )
+            with self._client.stream(
+                "POST",
+                self._url,
+                headers={"Authorization": f"Bearer {self._token}"},
+                json={"site_id": self._site_id, "logical_path": path},
+            ) as response:
                 if response.status_code == 404:
                     return None
                 response.raise_for_status()
-                if len(response.content) > 4096:
-                    raise ValueError("oversized digest response")
-                result = DigestResponse.model_validate_json(response.content)
+                content = bytearray()
+                for chunk in response.iter_bytes():
+                    content.extend(chunk)
+                    if len(content) > 4096:
+                        raise ValueError("oversized digest response")
+                result = DigestResponse.model_validate_json(content)
         except (httpx.HTTPError, ValueError, ValidationError) as exc:
             raise StorageUnavailableError("authoritative digest request failed") from exc
         return ObjectDigest(size_bytes=result.size_bytes, sha256=result.sha256)

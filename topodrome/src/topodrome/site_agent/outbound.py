@@ -45,13 +45,20 @@ TransportFactory = Callable[[], AgentTransport]
 class OutboundClient:
     """Persist-before-send event publisher with ordered cumulative ACKs."""
 
-    def __init__(self, spool: EventSpool, transport_factory: TransportFactory) -> None:
+    def __init__(
+        self,
+        spool: EventSpool,
+        transport_factory: TransportFactory,
+        *,
+        heartbeat_ack: Callable[[SpoolEvent, Mapping[str, Any]], None] | None = None,
+    ) -> None:
         self._spool = spool
         self._transport_factory = transport_factory
         self._transport: AgentTransport | None = None
         self._flush_lock = asyncio.Lock()
         self._request_events: dict[str, SpoolEvent] = {}
         self._request_results: dict[str, Mapping[str, Any]] = {}
+        self.heartbeat_ack = heartbeat_ack
 
     def enqueue(self, kind: str, payload: Mapping[str, Any]) -> SpoolEvent:
         return self._spool.append(kind, payload)
@@ -273,6 +280,8 @@ class OutboundClient:
     def _remember_request_result(
         self, event: SpoolEvent, payload: Mapping[str, Any]
     ) -> None:
+        if event.kind == "heartbeat" and self.heartbeat_ack is not None:
+            self.heartbeat_ack(event, payload)
         if any(item.event_id == event.event_id for item in self._request_events.values()):
             self._request_results[event.event_id] = dict(payload)
 

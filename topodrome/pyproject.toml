@@ -32,6 +32,7 @@ scheduler = [
 ]
 agent = [
   "aiosqlite>=0.20",
+  "asyncssh>=2.21,<3",
   "nvidia-ml-py>=12.560",
   "psutil>=6.1",
   "websockets>=14.1",
@@ -60,6 +61,7 @@ topodrome-agent = "topodrome.site_agent.app:main"
 topodrome-build-autodl-bootstrap = "topodrome.deployment.autodl:main"
 topodrome-jupyter-agent-bootstrap = "topodrome.deployment.jupyter_agent:main"
 topodrome-managed-jupyter = "topodrome.jupyter.managed_server:main"
+topodrome-updater = "topodrome.deployment.updater:main"
 
 [dependency-groups]
 dev = [

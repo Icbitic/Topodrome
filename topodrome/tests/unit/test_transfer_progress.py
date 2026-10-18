@@ -1,7 +1,4 @@
 import json
-import subprocess
-import sys
-import threading
 from concurrent.futures import ThreadPoolExecutor
 
 import pytest
@@ -11,51 +8,9 @@ from topodrome.domain.progress import PROGRESS_PREFIX, JobProgress
 from topodrome.site_agent.transfer_progress import TransferLogReporter
 from topodrome.storage import LocalStorage
 from topodrome.storage.artifacts import AttemptArtifactStore
-from topodrome.storage.progress import cancellable_transfers, observe_transfers, transfer_progress
-from topodrome.storage.rclone_progress import run_upload
+from topodrome.storage.progress import observe_transfers, transfer_progress
 
 pytestmark = pytest.mark.unit
-
-
-def test_stats_are_live_bounded_and_only_numeric(tmp_path):
-    events = []
-    script = (
-        "import sys,json; "
-        "sys.stderr.write('x'*200000+'\\n'); "
-        "print(json.dumps({'stats':{'bytes':40},'msg':'SECRET'}),file=sys.stderr); "
-        "print('{bad}',file=sys.stderr); "
-        "print(json.dumps({'stats':{'bytes':999}}),file=sys.stderr)"
-    )
-    with observe_transfers(lambda *args: events.append(args)):
-        result = run_upload([sys.executable, "-c", script], timeout=5, size=100)
-    assert result.returncode == 0
-    assert events == [("upload", 40, 100), ("upload", 100, 100)]
-
-
-def test_timeout_kills_and_reaps_process():
-    with pytest.raises(subprocess.TimeoutExpired):
-        run_upload([sys.executable, "-c", "import time; time.sleep(5)"], timeout=0.1, size=5)
-
-
-def test_cancellation_interrupts_upload_without_waiting_for_transfer_timeout():
-    stopped = threading.Event()
-    timer = threading.Timer(0.05, stopped.set)
-    timer.start()
-    try:
-        with (
-            cancellable_transfers(stopped),
-            pytest.raises(RuntimeError, match="transfer canceled"),
-        ):
-            run_upload([sys.executable, "-c", "import time; time.sleep(10)"], timeout=20, size=5)
-    finally:
-        timer.cancel()
-        timer.join()
-
-
-def test_failed_upload_stays_failed():
-    assert (
-        run_upload([sys.executable, "-c", "raise SystemExit(2)"], timeout=5, size=5).returncode == 2
-    )
 
 
 def test_observers_are_nested_and_thread_local():

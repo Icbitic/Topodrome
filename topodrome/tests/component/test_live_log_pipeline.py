@@ -51,7 +51,7 @@ async def _running_attempt(
         ),
         models=(
             ModelCapability(
-                alias="model",
+                repo_id="test/model",
                 revision="revision",
                 backend="transformers",
                 backend_version="configured",
@@ -62,7 +62,7 @@ async def _running_attempt(
     )
     spec = JobSpec(
         entrypoint="experiment.py",
-        model={"alias": "model", "revision": "revision"},
+        model={"repo_id": "test/model", "revision": "revision"},
         resources={"gpu": 1, "min_vram_gb": 1},
         retry={"max_attempts": 1},
     )

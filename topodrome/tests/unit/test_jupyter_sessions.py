@@ -19,7 +19,7 @@ pytestmark = pytest.mark.unit
 
 def _request(mode: KernelMode, *, gpu: int = 1) -> KernelRequest:
     return KernelRequest(
-        model="llama",
+        model="test/llama",
         mode=mode,
         resources=ResourceRequirements(gpu=gpu),
         idle_timeout_seconds=60,

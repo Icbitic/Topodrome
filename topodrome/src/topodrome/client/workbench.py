@@ -37,20 +37,25 @@ from textual.widgets import (
 )
 from textual.widgets.option_list import Option
 
+from topodrome.domain.scheduling import SitePreferenceRequest
 from topodrome.domain.specs import GPUReservationExtensionRequest, GPUReservationRequest
 
 from .async_client import AsyncClient
 from .dashboard import _gpu_owner_color, _gpu_util_color, _progress_text
 from .workbench_arrays import array_row, job_tree
+from .workbench_assets import asset_cells, asset_group, asset_tree
 from .workbench_autodl import autodl_rows
 from .workbench_details import attempts_page, date, detail_page, models_page, timing_cell
 from .workbench_gpus import gpu_cells, gpu_key, gpu_tree
 from .workbench_impact import reservation_impact
 from .workbench_logs import JobLogs
+from .workbench_site_order import SiteOrderDraft
+from .workbench_system import system_rows
 
-VIEWS = ("jobs", "gpus", "sites", "assets", "reservations", "autodl")
+VIEWS = ("jobs", "gpus", "sites", "assets", "reservations", "autodl", "system")
 VIEW_LABELS = {"gpus": "GPUs", "autodl": "AutoDL"}
 ACTION_LABELS = {
+    "site-order": "Reorder sites",
     "reserve": "Reserve GPU…",
     "extend": "Extend reservation…",
     "unreserve": "Cancel reservation…",
@@ -214,6 +219,8 @@ class TerminalDefaults(NoColor):
 def status_cell(value, column):
     """Color status fields only, never user-controlled names, paths or logs."""
     color = None
+    if column == "Pref" and value.startswith("#"):
+        color = "cyan"
     if column == "Owner":
         color = _gpu_owner_color(value)
     if column == "Util" and value.endswith("%"):
@@ -769,6 +776,11 @@ class Workbench(App):
         Binding("right", "adjacent_tab(1)", "Next tab", priority=True),
         Binding("shift+left", "pan_content(-1)", "Scroll left"),
         Binding("shift+right", "pan_content(1)", "Scroll right"),
+        Binding("shift+up", "move_site(-1)", "Move site up", priority=True),
+        Binding("shift+down", "move_site(1)", "Move site down", priority=True),
+        Binding("up", "move_picked_site(-1)", "Move picked site up", priority=True),
+        Binding("down", "move_picked_site(1)", "Move picked site down", priority=True),
+        Binding("enter", "save_site_order", "Save site order", priority=True),
         ("q", "safe_quit", "Quit"),
         ("ctrl+c", "safe_quit", "Quit"),
         ("ctrl+q", "safe_quit", "Quit"),
@@ -779,7 +791,7 @@ class Workbench(App):
         ("d", "details", "Details"),
         ("a", "context_action", "Action"),
         ("n", "register_instance", "Register AutoDL"),
-        ("space", "toggle_expansion", "Expand / collapse"),
+        Binding("space", "toggle_expansion", "Expand / collapse / reorder", priority=True),
         ("escape", "back", "Back"),
         ("question_mark", "help", "Help"),
         *((str(i), f"view('{view}')", view.title()) for i, view in enumerate(VIEWS, 1)),
@@ -795,6 +807,8 @@ class Workbench(App):
         self.asset_rows = []
         self.reservation_rows = []
         self.autodl_instances = []
+        self.system_info = None
+        self.system_error = None
         self.expanded_gpus = set()
         self._reservations_checked_at = None
         self._reservations_failed = False
@@ -803,12 +817,17 @@ class Workbench(App):
         self._detail_records = {v: {} for v in VIEWS}
         self.selections = {}
         self.show_history = False
+        self.expanded_assets = set()
+        self.asset_history = []
+        self.asset_history_state = "loading"
+        self.asset_history_limited = False
         self.job_sort = "queue"
         self.last_success = None
         self.failure = None
         self._refresh_busy = False
         self._extra_busy = False
         self._action_busy = False
+        self._site_order = None
         self._detail_worker = None
         self._logs_worker = None
         self._log_generation = 0
@@ -870,6 +889,11 @@ class Workbench(App):
                                     )
         yield Static("", id="selection", markup=False)
         with Horizontal(id="actions"):
+            yield FormButton("↑ Up", id="order-up")
+            yield FormButton("↓ Down", id="order-down")
+            yield FormButton("Auto", id="order-automatic")
+            yield FormButton("Save", id="order-save")
+            yield FormButton("Cancel", id="order-cancel")
             yield Button("GPU reservations", id="manage-reservations")
             yield Button("Models", id="page-models")
             yield Button("Reload policy", id="page-reload")
@@ -916,7 +940,7 @@ class Workbench(App):
     def tick(self):
         self.refresh_status()
         self.schedule_detail()
-        if self.active_view in {"assets", "reservations", "gpus", "autodl"}:
+        if self.active_view in {"assets", "reservations", "gpus", "autodl", "system"}:
             self.refresh_extras()
 
     @property
@@ -941,6 +965,8 @@ class Workbench(App):
         except Exception as exc:
             if version == self._mutation_version:
                 self.failure = safe_error(exc)
+                if self.is_running:
+                    self.update_actions()
         finally:
             self._refresh_busy = False
             self.update_status()
@@ -988,7 +1014,27 @@ class Workbench(App):
         version = self._mutation_version
         try:
             if view == "assets":
-                self.asset_rows = [mapping(a) for a in await self.client.assets(limit=100)]
+                rows = await self.client.assets(limit=100, all_versions=False)
+                if version != self._mutation_version:
+                    return
+                self.asset_rows = [mapping(a) for a in rows]
+                self.expanded_assets.intersection_update(
+                    asset_group(row) for row in self.asset_rows
+                )
+                self.render_tables()
+                if self.expanded_assets:
+                    try:
+                        rows = await self.client.assets(limit=1000, all_versions=True)
+                        if version != self._mutation_version:
+                            return
+                        self.asset_history = [mapping(a) for a in rows]
+                        self.asset_history_limited = len(rows) >= 1000
+                        self.asset_history_state = "ready"
+                    except Exception:
+                        self.asset_history_state = "error"
+            elif view == "system":
+                self.system_info = await self.client.system_metrics()
+                self.system_error = None
             elif view == "autodl":
                 rows = await self.client.autodl_instances()
                 if version != self._mutation_version:
@@ -1012,6 +1058,9 @@ class Workbench(App):
         except Exception as exc:
             if version != self._mutation_version:
                 return
+            if view == "system":
+                self.system_error = safe_error(exc)
+                self.render_tables()
             if view in {"gpus", "reservations"}:
                 self._reservations_failed = True
                 self.update_actions()
@@ -1024,7 +1073,7 @@ class Workbench(App):
             if (
                 self.is_running
                 and (version != self._mutation_version or view != self.active_view)
-                and self.active_view in {"assets", "gpus", "reservations", "autodl"}
+                and self.active_view in {"assets", "gpus", "reservations", "autodl", "system"}
             ):
                 self.refresh_extras()
 
@@ -1076,7 +1125,23 @@ class Workbench(App):
         )
         # Queue mode preserves the scheduler's aged/priority/runtime order;
         # an array occupies the position of its first visible child.
-        sites = self.snapshot.get("sites", [])
+        policy = self.snapshot.get("policy") or {}
+        draft = self._site_order
+        preference = list(draft.preferences if draft else policy.get("preferred_site_ids", []))
+        site_rows = self.snapshot.get("sites", [])
+        if draft:
+            site_rows = draft.rows(site_rows)
+        sites = [
+            {
+                **site,
+                "preference_rank": (
+                    preference.index(site["site_id"]) + 1 if site["site_id"] in preference else None
+                ),
+            }
+            for site in site_rows
+        ]
+        if not draft:
+            sites.sort(key=lambda row: row["preference_rank"] or len(preference) + 1)
         gpus = self.snapshot.get("gpus", [])
         arrays = [
             array_row(row, self.expanded_arrays, self.array_cache, self.array_errors)
@@ -1084,6 +1149,12 @@ class Workbench(App):
         ]
         self.expanded_gpus.intersection_update(gpu_key(row) for row in gpus)
         tables = {
+            "system": (
+                system_rows(self.system_info, self.system_error),
+                lambda r: r["metric_id"],
+                ("Metric", "Value", "Notes"),
+                lambda r: (r["name"], r["value"], r["note"]),
+            ),
             "jobs": (
                 jobs,
                 lambda r: r["job_id"],
@@ -1110,9 +1181,10 @@ class Workbench(App):
             "sites": (
                 sites,
                 lambda r: r["site_id"],
-                ("Site", "Kind", "State", "Heartbeat age", "Queue", "Storage"),
+                ("Site", "Pref", "Kind", "State", "Heartbeat age", "Queue", "Storage"),
                 lambda r: (
-                    r["site_id"],
+                    ("↕ " if draft and draft.grabbed == r["site_id"] else "") + r["site_id"],
+                    f"#{r['preference_rank']}" if r.get("preference_rank") else "—",
                     r.get("kind"),
                     r.get("state"),
                     age(r.get("heartbeat_at")),
@@ -1121,17 +1193,17 @@ class Workbench(App):
                 ),
             ),
             "assets": (
-                self.asset_rows,
+                asset_tree(
+                    self.asset_rows,
+                    self.asset_history,
+                    self.expanded_assets,
+                    query=query,
+                    state=self.asset_history_state,
+                    limited=self.asset_history_limited,
+                ),
                 lambda r: r["ref"],
                 ("Name", "Version", "Visibility", "GiB", "Files", "Tags"),
-                lambda r: (
-                    r["name"],
-                    r["version"],
-                    r["visibility"],
-                    f"{r['total_size_bytes'] / 1024**3:.3f}",
-                    len(r["files"]),
-                    ", ".join(r.get("tags", [])),
-                ),
+                asset_cells,
             ),
             "reservations": (
                 self.reservation_rows,
@@ -1143,18 +1215,29 @@ class Workbench(App):
                 autodl_rows(sites, self.autodl_instances),
                 lambda r: r["site_id"],
                 ("Site", "State", "GPUs", "Agent", "Region", "Queue"),
-                lambda r: (r["site_id"], r["state"], r.get("gpu_count"),
-                           r.get("site_state", r["state"]), r.get("region"), r.get("queue_depth")),
+                lambda r: (
+                    r["site_id"],
+                    r["state"],
+                    r.get("gpu_count"),
+                    r.get("site_state", r["state"]),
+                    r.get("region"),
+                    r.get("queue_depth"),
+                ),
             ),
         }
         for view, (rows, key, columns, cells) in tables.items():
             # Open details outlive list filters, including a job becoming terminal.
             detail_rows = (
-                [*known_jobs.values(), *arrays, *jobs] if view == "jobs"
-                else [*gpus, *rows] if view == "gpus" else rows
+                [*known_jobs.values(), *arrays, *jobs]
+                if view == "jobs"
+                else [*gpus, *rows]
+                if view == "gpus"
+                else [*self.asset_history, *self.asset_rows, *rows]
+                if view == "assets"
+                else rows
             )
             self._detail_records[view] = {key(row): row for row in detail_rows}
-            if view not in {"jobs", "gpus"}:
+            if view not in {"jobs", "gpus", "assets"} and not (view == "sites" and draft):
                 rows = [r for r in rows if not query or query in str(r).casefold()]
             records = {key(r): r for r in rows}
             old_record = self.records[view].get(self.selections.get(view), {})
@@ -1178,6 +1261,9 @@ class Workbench(App):
                             "Model": 24,
                             "Reason": 30,
                             "Tags": 28,
+                            "Metric": 26,
+                            "Value": 22,
+                            "Notes": max(18, self.size.width - 58),
                         }.get(label),
                     )
                     for label in columns
@@ -1198,10 +1284,9 @@ class Workbench(App):
             previous = self._table_cache.get(view, [])
             old_selection = self.selections.get(view)
             scroll = (table.scroll_x, table.scroll_y)
-            if (
-                [r[0] for r in desired] == [r[0] for r in previous]
-                and labels == self._row_labels.get(view)
-            ):
+            if [r[0] for r in desired] == [
+                r[0] for r in previous
+            ] and labels == self._row_labels.get(view):
                 for (identity, values), (_, old_values) in zip(desired, previous, strict=True):
                     for col, label, value, old in zip(
                         table.columns, columns, values, old_values, strict=True
@@ -1224,6 +1309,8 @@ class Workbench(App):
                     selected = old_record["array_id"]
                 if old_selection not in records and old_record.get("_gpu_parent") in records:
                     selected = old_record["_gpu_parent"]
+                if old_selection not in records and old_record.get("_asset_parent") in records:
+                    selected = old_record["_asset_parent"]
                 self.selections[view] = selected
                 if selected:
                     table.move_cursor(row=ids.index(selected), animate=False, scroll=False)
@@ -1246,6 +1333,7 @@ class Workbench(App):
                     "autodl": "No registered AutoDL sites.\n"
                     "Press n or choose Register AutoDL above.\n"
                     "Paste its SSH command and password; review before installing the agent.",
+                    "system": "No matching system metrics.",
                 }[view]
                 if query:
                     message = "No matching rows.\nPress Esc to clear the filter."
@@ -1288,15 +1376,26 @@ class Workbench(App):
             and key in self.records[self.active_view]
         ):
             self.selections[self.active_view] = key
-            self.show_details()
+            if self.active_view == "sites" and self._site_order:
+                # A mouse click selects another row while reordering. Only
+                # explicit Save / Enter commits, never a row click.
+                self._site_order.grabbed = None
+                self.render_tables()
+                self.focus_primary()
+            else:
+                self.show_details()
 
     @on(DataTable.RowLabelSelected)
     def disclosure_selected(self, event):
         view = (event.data_table.id or "").removeprefix("table-")
         key = event.row_key.value if event.row_key is not None else None
         row = self.records.get(view, {}).get(key)
-        if (self.screen is self._main and self.active_view == view
-                and row and self.disclosure_label(view, row) is not None):
+        if (
+            self.screen is self._main
+            and self.active_view == view
+            and row
+            and self.disclosure_label(view, row) is not None
+        ):
             self.selections[view] = key
             self.action_toggle_expansion()
 
@@ -1308,13 +1407,17 @@ class Workbench(App):
     def tab_changed(self, event):
         if event.pane.id != self.active_view:
             return
+        if self.active_view != "sites" and self._site_order and not self._action_busy:
+            self._site_order = None
+            self.set_notice("Unapplied site order discarded.")
+            self.render_tables()
         self.update_actions()
         self.schedule_detail()
         if not self._main.has_class("details-open") and (
             isinstance(self.focused, Tabs) or not self.visible_focus(self.focused)
         ):
             self.focus_primary()
-        if self.active_view in {"assets", "reservations", "gpus", "autodl"}:
+        if self.active_view in {"assets", "reservations", "gpus", "autodl", "system"}:
             self.refresh_extras()
         elif self.active_view == "jobs":
             self.refresh_expanded_arrays()
@@ -1437,8 +1540,12 @@ class Workbench(App):
                 group="logs",
                 exit_on_error=False,
             )
-        if (not (row and row.get("is_array")) and not changed
-                and self._detail_worker and not self._detail_worker.is_finished):
+        if (
+            not (row and row.get("is_array"))
+            and not changed
+            and self._detail_worker
+            and not self._detail_worker.is_finished
+        ):
             return
         title = (
             f"{plain(row['site_id'])} / GPU {plain(row.get('index'))}"
@@ -1521,20 +1628,152 @@ class Workbench(App):
             if view == "gpus" and not row.get("operator_reserved"):
                 return {"reserve"}
             return set()
+        if view == "sites":
+            return {"site-order"} if self.site_order_available() else set()
         return {
             "autodl": {"release", "unregister"}
             if row.get("state") in {"offline", "stopped"}
             else {"release"},
         }.get(view, set())
 
+    def site_order_available(self):
+        policy = self.snapshot.get("policy") or {}
+        return (
+            not self.failure
+            and self.last_success is not None
+            and time.monotonic() - self.last_success <= max(5, self.interval * 3)
+            and isinstance(policy.get("generation"), int)
+            and "preferred_site_ids" in policy
+            and not policy.get("pending_generation")
+        )
+
+    def site_order_save_available(self):
+        draft = self._site_order
+        policy = self.snapshot.get("policy") or {}
+        registered = {row["site_id"] for row in self.snapshot.get("sites", [])}
+        return (
+            draft is not None
+            and draft.changed
+            and self.site_order_available()
+            and draft.generation == policy.get("generation")
+            and set(draft.preferences) <= registered
+        )
+
+    def begin_site_order(self):
+        if self.screen is not self._main or self.active_view != "sites" or self._action_busy:
+            return False
+        if self._site_order is None:
+            if not self.site_order_available():
+                self.set_notice("Site order is unavailable or stale. Refresh before editing.")
+                return False
+            self._site_order = SiteOrderDraft.capture(
+                self.snapshot["policy"], self.snapshot.get("sites", [])
+            )
+            self._main.remove_class("searching")
+            self.widget("#filter", Input).value = ""
+            self.set_notice("")
+            self.render_tables()
+        self.focus_primary()
+        return True
+
+    def action_move_site(self, direction):
+        if not self.check_action("move_site", (direction,)) or not self.begin_site_order():
+            return
+        selected = self.selections.get("sites")
+        if self._site_order.move(selected, direction):
+            if self._site_order.grabbed is not None:
+                self._site_order.grabbed = selected
+            self.render_tables()
+            table = self.widget("#table-sites", DataTable)
+            table.move_cursor(row=list(self.records["sites"]).index(selected), animate=False)
+        self.focus_primary()
+
+    def action_pick_site(self):
+        if not self.begin_site_order():
+            return
+        draft = self._site_order
+        selected = self.selections.get("sites")
+        if draft.grabbed is not None:
+            draft.grabbed = None
+        elif selected in draft.order:
+            draft.grabbed = selected
+        else:
+            self.set_notice("Cancel and reorder again to include newly registered sites.")
+        self.render_tables()
+        self.focus_primary()
+
+    def action_move_picked_site(self, direction):
+        if not self.check_action("move_picked_site", (direction,)) or self._action_busy:
+            return
+        # A refresh may queue transient highlights; moving is bound to the
+        # exact picked-up site, not a cursor position or a queued highlight.
+        self.selections["sites"] = self._site_order.grabbed
+        self.action_move_site(direction)
+
+    def action_save_site_order(self):
+        draft = self._site_order
+        if draft is None or self._action_busy:
+            return
+        if not draft.changed:
+            self.set_notice("No site order changes. Esc returns to browsing.")
+            return
+        if not self.site_order_save_available():
+            self.set_notice(
+                "Site order changed or is stale. Esc cancels; refresh and reorder again."
+            )
+            return
+        try:
+            request = SitePreferenceRequest(
+                preferred_site_ids=draft.preferences, expected_generation=draft.generation
+            )
+        except ValueError:
+            self.set_notice("Order must contain at most 64 unique registered sites.")
+            return
+        self.action_confirmed(
+            (
+                "site-order",
+                {"site_id": "Scheduler placement"},
+                request.model_dump(mode="json"),
+                {},
+                "workbench-" + uuid4().hex,
+            ),
+            origin=ActionFocus("sites", self.selections.get("sites"), False),
+        )
+
+    def cancel_site_order(self):
+        if self._action_busy:
+            self.set_notice("Site order is being saved; wait for its result.")
+            return
+        self._site_order = None
+        self.set_notice("")
+        self.render_tables()
+        self.focus_primary()
+
+    @on(Button.Pressed, "#order-up, #order-down, #order-automatic, #order-save, #order-cancel")
+    def order_button_pressed(self, event):
+        event.stop()
+        if event.button.disabled or self._site_order is None or self._action_busy:
+            return
+        if event.button.id in {"order-up", "order-down"}:
+            self.action_move_site(-1 if event.button.id == "order-up" else 1)
+        elif event.button.id == "order-automatic":
+            self._site_order.automatic()
+            self.render_tables()
+            self.focus_primary()
+        elif event.button.id == "order-save":
+            self.action_save_site_order()
+        elif event.button.id == "order-cancel":
+            self.cancel_site_order()
+
     def update_actions(self):
         row = self.selected()
         view = self.active_view
         valid = self.available_actions()
         details_open = self._main.has_class("details-open")
+        ordering = view == "sites" and self._site_order is not None and not details_open
         self.widget("#actions", Horizontal).display = not details_open
         register = self.widget("#page-register", Button)
-        register.display = not details_open and view in {"sites", "autodl"}
+        register.display = not details_open and view in {"sites", "autodl"} and not ordering
         register.disabled = self._action_busy
         actions = tuple(operation for operation in ACTION_LABELS if operation in valid)
         options = self.widget("#detail-actions", OptionList)
@@ -1581,6 +1820,30 @@ class Workbench(App):
         self.widget("#detail-actions-title", Static).display = bool(actions)
         self.update_detail_context()
         for button in self._main.query("#actions Button"):
+            if button.id.startswith("order-"):
+                button.display = ordering
+                disabled = self._action_busy or not self.site_order_available()
+                if ordering:
+                    draft = self._site_order
+                    selected = self.selections.get("sites")
+                    index = draft.order.index(selected) if selected in draft.order else None
+                    if button.id == "order-up":
+                        disabled |= index is None or index == 0
+                    elif button.id == "order-down":
+                        disabled |= index is None or index >= len(draft.order) - 1
+                    elif button.id == "order-automatic":
+                        disabled |= not draft.preferences
+                    elif button.id == "order-save":
+                        disabled |= not self.site_order_save_available()
+                    elif button.id == "order-cancel":
+                        disabled = self._action_busy
+                button.disabled = disabled
+                continue
+            if ordering:
+                button.display = False
+                continue
+            if button.id == "manage-reservations":
+                button.display = True
             if button.id.startswith("page-"):
                 operation = button.id.removeprefix("page-")
                 button.display = (
@@ -1596,7 +1859,10 @@ class Workbench(App):
             allowed = button.id.removeprefix("action-") in valid
             button.display = allowed
             button.disabled = self._action_busy or not allowed
-        count = sum(not row.get("_gpu_parent") for row in self.records[view].values())
+        count = sum(
+            not (row.get("_gpu_parent") or row.get("_asset_parent"))
+            for row in self.records[view].values()
+        )
         heading = Text(VIEW_LABELS.get(view, view.title()), style="bold")
         heading.append(f"  {count} shown", style="dim")
         if view == "jobs":
@@ -1606,6 +1872,27 @@ class Workbench(App):
                 style="dim",
             )
         query = self.widget("#filter", Input).value
+        if view == "assets":
+            heading.append(
+                "  /  latest versions · Space for history",
+                style="dim",
+            )
+        if view == "system":
+            heading.append("  /  central storage · read-only estimates", style="dim")
+        if view == "sites":
+            if ordering:
+                picked = self._site_order.grabbed
+                heading.append(
+                    "  /  " + ("move " + plain(picked) if picked else "reorder") + " · not saved",
+                    style="yellow",
+                )
+            else:
+                order = " → ".join(
+                    (self.snapshot.get("policy") or {}).get("preferred_site_ids", [])
+                )
+                heading.append(
+                    "  /  " + plain(order or "automatic placement", limit=100), style="cyan"
+                )
         if query:
             heading.append(f"  /  filter: {plain(query)}", style="cyan")
         self.widget("#page-heading", Static).update(heading)
@@ -1616,6 +1903,7 @@ class Workbench(App):
                 or row.get("reservation_id")
                 or row.get("uuid")
                 or row.get("site_id")
+                or row.get("metric_id")
             )
             if row
             else None
@@ -1652,6 +1940,14 @@ class Workbench(App):
                 + "? help · q quit"
             )
         )
+        if ordering:
+            mode = "↑↓ move · Space drop" if self._site_order.grabbed else "↑↓ select · Space pick"
+            ending = " · Enter save · Esc" + (" cancel" if self.size.width >= 60 else "")
+            self.widget("#hints", Static).update(Text(mode + ending, style="cyan"))
+        elif view == "sites" and not details_open:
+            self.widget("#hints", Static).update(
+                Text("↑↓ select · Space pick/move · Enter details · ←→ tabs · ? help")
+            )
         self.call_after_refresh(self.restore_action_focus)
         self.call_after_refresh(self.repair_focus)
 
@@ -1754,7 +2050,7 @@ class Workbench(App):
         if operation in {"register", "reload"} and not details:
             return ActionFocus(view, None, False, operation)
         row = self.selected()
-        if view not in {"gpus", "reservations", "autodl"} or not row:
+        if view not in {"gpus", "reservations", "autodl", "sites"} or not row:
             return None
         if target is not None:
             if target.get("site_id") != row.get("site_id"):
@@ -1827,6 +2123,9 @@ class Workbench(App):
                 self.focus_main(button)
             else:
                 self.focus_primary()
+        else:
+            self._focus_return = None
+            self.focus_primary()
 
     async def on_event(self, event):
         # Input may be consumed by widgets or priority bindings before on_key.
@@ -1887,6 +2186,11 @@ class Workbench(App):
         if operation not in {*ACTION_LABELS, "register", "reload"}:
             return
         row = target if target is not None else self.selected()
+        if operation == "site-order":
+            if self._main.has_class("details-open"):
+                self.action_back()
+            self.action_pick_site()
+            return
         if target is None and operation in {"extend", "unreserve"}:
             if operation not in self.available_actions():
                 self.set_notice(
@@ -1952,11 +2256,15 @@ class Workbench(App):
                 # startup immediately, before the first site-agent heartbeat.
                 if response.get("site_id"):
                     self.autodl_instances = [
-                        row for row in self.autodl_instances
+                        row
+                        for row in self.autodl_instances
                         if row.get("site_id") != response["site_id"]
-                    ] + [{
-                        "site_id": response["site_id"], "state": response.get("state", "starting"),
-                    }]
+                    ] + [
+                        {
+                            "site_id": response["site_id"],
+                            "state": response.get("state", "starting"),
+                        }
+                    ]
                     self.render_tables()
                 detail = " Registration accepted: " + plain(
                     response.get("site_id", "inspect AutoDL view")
@@ -1966,6 +2274,13 @@ class Workbench(App):
                 detail = " Policy request accepted; " + plain(
                     response.get("status", "inspect policy status")
                 )
+            elif operation == "site-order":
+                response = await self.client.set_site_preference(SitePreferenceRequest(**values))
+                self.snapshot["policy"] = response
+                self._site_order = None
+                self.render_tables()
+                order = " → ".join(response.get("preferred_site_ids", []))
+                detail = " New placements: " + (order or "automatic") + ". Running jobs unchanged."
             else:
                 raise ValueError("unsupported management action")
             self.set_notice(f"✓ {operation}: request completed.{detail}")
@@ -1997,9 +2312,12 @@ class Workbench(App):
             self.exit()
 
     def action_register_instance(self):
-        if (self.screen is self._main and not self.editing_input()
-                and not self._main.has_class("details-open")
-                and self.active_view in {"sites", "autodl"}):
+        if (
+            self.screen is self._main
+            and not self.editing_input()
+            and not self._main.has_class("details-open")
+            and self.active_view in {"sites", "autodl"}
+        ):
             self.command_chosen("register")
 
     def expansion_target(self, view, row):
@@ -2007,6 +2325,8 @@ class Workbench(App):
             return None
         if view == "gpus":
             return row.get("_gpu_parent") or gpu_key(row), self.expanded_gpus
+        if view == "assets":
+            return asset_group(row), self.expanded_assets
         if view == "jobs":
             identity = row["job_id"] if row.get("is_array") else row.get("array_id")
             if self.records[view].get(identity, {}).get("is_array"):
@@ -2014,7 +2334,11 @@ class Workbench(App):
         return None
 
     def disclosure_label(self, view, row):
-        parent = (view == "gpus" and not row.get("_gpu_parent")) or row.get("is_array")
+        parent = (
+            (view == "gpus" and not row.get("_gpu_parent"))
+            or (view == "assets" and not row.get("_asset_parent"))
+            or row.get("is_array")
+        )
         target = self.expansion_target(view, row) if parent else None
         if target is not None:
             identity, expanded = target
@@ -2022,8 +2346,14 @@ class Workbench(App):
         return None
 
     def action_toggle_expansion(self):
-        if (self.screen is not self._main
-                or self.editing_input() or self._main.has_class("details-open")):
+        if (
+            self.screen is not self._main
+            or self.editing_input()
+            or self._main.has_class("details-open")
+        ):
+            return
+        if self.active_view == "sites":
+            self.action_pick_site()
             return
         target = self.expansion_target(self.active_view, self.selected())
         if target is not None:
@@ -2034,6 +2364,9 @@ class Workbench(App):
                 expanded.add(identity)
                 if self.active_view == "jobs":
                     self.refresh_array(identity)
+                elif self.active_view == "assets":
+                    self.asset_history_state = "loading"
+                    self.refresh_extras()
             self.render_tables()
             self.focus_primary()
 
@@ -2041,6 +2374,9 @@ class Workbench(App):
         self.tick()
 
     def action_search(self):
+        if self.active_view == "sites" and self._site_order:
+            self.set_notice("Enter saves the site order; Esc cancels before filtering.")
+            return
         self._main.add_class("searching")
         self.focus_main(self.widget("#filter", Input))
 
@@ -2050,7 +2386,9 @@ class Workbench(App):
         self.focus_primary()
 
     def action_history(self):
-        if self.screen is not self._main or self.active_view != "jobs" or self.editing_input():
+        if self.screen is not self._main or self.editing_input():
+            return
+        if self.active_view != "jobs":
             return
         self.show_history = not self.show_history
         self.render_tables()
@@ -2076,9 +2414,15 @@ class Workbench(App):
             self.show_details()
 
     def show_details(self):
+        if self.active_view == "sites" and self._site_order:
+            self.set_notice("Enter saves the site order; Esc cancels before opening details.")
+            return
         row = self.selected()
         if not self._main.has_class("details-open"):
             row = self.selected()
+            if self.active_view == "assets" and row and row.get("_asset_info"):
+                self.selections["assets"] = row["_asset_parent"]
+                row = self.records["assets"][row["_asset_parent"]]
             if self.active_view == "gpus" and row and row.get("_gpu_parent"):
                 self.selections["gpus"] = row["_gpu_parent"]
                 row = self.records["gpus"][row["_gpu_parent"]]
@@ -2124,6 +2468,28 @@ class Workbench(App):
         self.focus_primary()
 
     def check_action(self, action, parameters):
+        if action in {"move_site", "move_picked_site", "save_site_order"}:
+            available = (
+                hasattr(self, "_main")
+                and self.screen is self._main
+                and self.active_view == "sites"
+                and not self._main.has_class("details-open")
+                and not self.editing_input()
+            )
+            if action == "save_site_order":
+                return (
+                    available
+                    and self._site_order is not None
+                    and isinstance(self.focused, DataTable)
+                )
+            if action == "move_picked_site":
+                return (
+                    available
+                    and isinstance(self.focused, DataTable)
+                    and self._site_order is not None
+                    and self._site_order.grabbed is not None
+                )
+            return available
         if action == "toggle_expansion":
             return (
                 hasattr(self, "_main")
@@ -2131,7 +2497,11 @@ class Workbench(App):
                 and not self._main.has_class("details-open")
                 and isinstance(self.focused, DataTable)
                 and self.focused.id == f"table-{self.active_view}"
-                and self.expansion_target(self.active_view, self.selected()) is not None
+                and (
+                    bool(self.selected())
+                    if self.active_view == "sites"
+                    else self.expansion_target(self.active_view, self.selected()) is not None
+                )
             )
         if action in {"adjacent_tab", "pan_content"}:
             # Priority arrows must fall through to native editing and modal
@@ -2174,6 +2544,9 @@ class Workbench(App):
     def action_back(self):
         if self.screen is not self._main:
             return
+        if self.active_view == "sites" and self._site_order:
+            self.cancel_site_order()
+            return
         if self._main.has_class("details-open"):
             self._focus_return = None
             self._main.remove_class("details-open")
@@ -2189,21 +2562,27 @@ class Workbench(App):
             self.push_screen(
                 ChoiceDialog(
                     "SHORTCUTS\n\n1 Jobs · 2 GPUs · 3 Sites\n"
-                    "4 Assets · 5 Reservations · 6 AutoDL\n\n"
+                    "4 Assets · 5 Reservations · 6 AutoDL · 7 System\n\n"
                     "Job details: 1 Summary · 2 Attempts · 3 Logs\n"
                     "Array and resource details: Summary\n"
                     "Esc returns to the main views.\n\n"
                     "↑↓ Select row   Enter Details   Esc Back\n/ Filter   Enter Finish filtering\n"
                     "Enter opens details with available actions shown directly.\n"
-                    "On arrays and GPUs, Space or the disclosure arrow expands/collapses\n"
-                    "members or foreign processes inline. Enter/click the row opens details.\n"
+                    "On arrays, GPUs and assets, Space or the disclosure arrow expands/collapses\n"
+                    "members, processes or older versions. Enter/click the row opens details.\n"
                     "Enter shows the same read-only process list in GPU details.\n"
                     "n registers an already-rented instance from AutoDL or Sites.\n"
+                    "On Sites, ↑↓ selects; Space picks up a site, then ↑↓ moves it.\n"
+                    "Space drops it to select another · Enter saves · Esc cancels.\n"
+                    "Site details → Reorder sites offers the same inline mouse controls.\n"
+                    "Shift+↑↓ is an optional shortcut; no modifier keys are required.\n"
+                    "Auto restores automatic placement. No separate screen.\n"
+                    "Site order saves live without moving running work.\n"
                     "↑↓ chooses an action; Enter opens its review form.\n"
                     "a Focus detail actions   d Toggle details\n"
-                    "Changes still require review and confirmation.\n"
+                    "Disruptive management actions require review and confirmation.\n"
                     "Page-wide actions remain in the list's bottom toolbar.\n"
-                    "h Include finished jobs   s Sort jobs\nr Refresh   q Quit\n\n"
+                    "h Toggle job history   s Sort jobs\nr Refresh   q Quit\n\n"
                     "←/→ switches tabs directly; Tab moves focus.\n"
                     "On a tab label, ↓ or Enter moves into its content.\n"
                     "Logs follow new output; scroll up to pause, End to follow again.\n"

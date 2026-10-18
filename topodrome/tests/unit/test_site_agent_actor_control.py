@@ -467,6 +467,34 @@ async def test_assignment_replacement_fences_all_sources_before_first_teardown(
     store.close()
 
 
+@pytest.mark.asyncio
+async def test_stale_single_gpu_replacement_flag_preserves_an_exact_warm_actor(tmp_path):
+    store = LeaseFenceStore(tmp_path / "leases.sqlite3")
+    store.reserve_actor(gpu_uuid="GPU-A", actor_id="resident", model_key="target", state="idle")
+    backend = _ExactBackend({"resident"})
+    agent = _agent(store, backend, _Sink())
+    assignment = Assignment(
+        "job",
+        "attempt",
+        LeaseRequest(
+            "lease",
+            "attempt",
+            ("GPU-A",),
+            {"GPU-A": 2},
+            1,
+            4_000_000_000,
+            model_key="target",
+            replace_idle_actors=True,
+        ),
+        "target",
+        "run.py",
+        raw_spec={"model": {"parallelism": {"mode": "single"}}},
+    )
+    assert await agent._evict_private_slot_actors(assignment) == ()
+    assert not backend.calls and store.actor_allocation("GPU-A").state == "idle"
+    store.close()
+
+
 def test_crash_left_stopping_intent_completes_during_exact_reconciliation(
     tmp_path: Any,
 ) -> None:

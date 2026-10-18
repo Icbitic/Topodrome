@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import os
 import sys
+from dataclasses import replace
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from typing import Any
@@ -23,7 +24,7 @@ EXACT_REVISION = "8afb486c1db24fe5011ec46dfbe5b5dccdb575c2"
 
 def model_key() -> ModelKey:
     return ModelKey(
-        alias="meta-llama-3-8b-instruct",
+        repo_id="meta-llama/Meta-Llama-3-8B-Instruct",
         revision="exact-commit",
         backend="transformers",
         backend_version="4.48.0",
@@ -62,6 +63,7 @@ def install_fake_backends(monkeypatch: pytest.MonkeyPatch) -> tuple[_Factory, _F
     torch.bfloat16 = object()
     torch.float16 = object()
     torch.float32 = object()
+    torch.device = lambda kind, index=None: kind if index is None else f"{kind}:{index}"
     torch.cuda = SimpleNamespace(empty_cache=lambda: empty_cache_calls.append("empty"))
     model_factory = _Factory(_Model())
     tokenizer_factory = _Factory(object())
@@ -244,7 +246,7 @@ def test_hf_acquirer_records_exact_revision_for_offline_verification(
     hub.snapshot_download = snapshot_download
     monkeypatch.setitem(sys.modules, "huggingface_hub", hub)
     key = ModelKey(
-        alias="model",
+        repo_id="test/model",
         revision=EXACT_REVISION,
         backend="transformers",
         backend_version="4.57.6",
@@ -265,3 +267,37 @@ def test_hf_acquirer_records_exact_revision_for_offline_verification(
 def test_loader_options_cannot_smuggle_credentials_to_an_actor(field: str) -> None:
     with pytest.raises(ValueError):
         ModelRegistration(key=model_key(), loader_options={field: "credential"})
+
+
+def test_selected_subfolder_reaches_both_transformers_loaders(tmp_path, monkeypatch):
+    model_factory, tokenizer_factory, _ = install_fake_backends(monkeypatch)
+    key = replace(model_key(), subfolder="checkpoints/step20000")
+    loaded = TransformersLoader(ModelRegistration(key=key, local_path=tmp_path))(key)
+    for factory in (model_factory, tokenizer_factory):
+        assert factory.calls[0][0] == str(tmp_path)
+        assert factory.calls[0][1]["subfolder"] == "checkpoints/step20000"
+        assert "revision" not in factory.calls[0][1]  # already a verified local snapshot
+    loaded.close()
+
+
+def test_acquisition_fetches_only_the_selected_registered_subfolder(tmp_path, monkeypatch):
+    calls = []
+    hub = ModuleType("huggingface_hub")
+
+    def snapshot_download(**kwargs):
+        calls.append(kwargs)
+        return str(tmp_path)
+
+    hub.snapshot_download = snapshot_download
+    monkeypatch.setitem(sys.modules, "huggingface_hub", hub)
+    key = replace(model_key(), revision=EXACT_REVISION, subfolder="checkpoints/step20000")
+    registration = ModelRegistration(key=key, origin=key.repo_id)
+    # Network-argument contract only; actual subtree verification is separately tested.
+    acquired = HuggingFaceModelAcquirer(destination=tmp_path, verify_payload=False).acquire(
+        registration
+    )
+    assert acquired.key == key
+    assert calls[0]["repo_id"] == key.repo_id
+    assert calls[0]["revision"] == EXACT_REVISION
+    assert calls[0]["allow_patterns"] == ["checkpoints/step20000/**"]
+    assert calls[0]["endpoint"] == "https://hf-mirror.com"

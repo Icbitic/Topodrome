@@ -14,7 +14,7 @@ site_kind: jupyter
 # an outbound Topodrome agent; no inbound Ray port is opened.
 allowed_gpu_indices: null
 # In mirror mode this is a site-local cache of Lab1's authoritative namespace,
-# not an independent global filesystem. It must equal rclone.mountpoint below.
+# not an independent global filesystem.
 global_root: /home/dpsk_a2a/.cache/topodrome/global
 scratch_root: /tmp/topodrome-scratch
 ray_short_temp_root: /tmp
@@ -54,18 +54,16 @@ model_config: /home/dpsk_a2a/.config/topodrome/models.yaml
 # false only when this site's model tree is trusted, immutable, and provisioned
 # out of band; downloaded and locally staged models are still fully verified.
 verify_preseeded_model_hashes: true
-# Direct rclone/SFTP mirroring needs no FUSE. The named remote is rooted at the
-# exact Lab1 global directory by its forced SFTP server; credentials and pinned
-# host keys live only in the owner-only rclone.conf named by RCLONE_CONFIG.
-rclone:
-  verification_via_scheduler: true
-  mode: mirror
-  mountpoint: /home/dpsk_a2a/.cache/topodrome/global
-  remote: 'lab1-global:'
-  # Required for mount-mode compatibility; direct mirror mode does not use it.
-  cache_dir: /tmp/topodrome-rclone-vfs-cache
-  binary: rclone
+# Remote sites use the enrolled-agent HTTP API for every file size. With SSH,
+# also configure a separate bulk_ssh_local_forward and its storage.bulk_url.
+storage:
+  small_file_max_bytes: 1048576
   min_free_space_gb: 10
-  poll_interval_seconds: 5
+  request_timeout_seconds: 30
   verification_timeout_seconds: 120
   transfer_timeout_seconds: 21600
+  # Optional measured renewal, only with an independently owned SSH bulk route.
+  # Set candidate_port to a free loopback port distinct from control/bulk ports.
+  bulk_reconnect:
+    enabled: false
+    candidate_port: null

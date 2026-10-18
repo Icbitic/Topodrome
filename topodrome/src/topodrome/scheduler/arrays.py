@@ -11,7 +11,7 @@ from topodrome.db.models import AttemptRow, JobArrayRow, JobRow, LeaseGPUClaimRo
 from topodrome.db.repositories import _scoped_job_idempotency_key
 from topodrome.domain.enums import JobState, LeaseState
 from topodrome.domain.errors import AdmissionRejectedError, ConflictError, NotFoundError
-from topodrome.domain.specs import new_id, utc_now
+from topodrome.domain.specs import JobSpec, new_id, utc_now
 
 TERMINAL = (JobState.SUCCEEDED, JobState.FAILED, JobState.CANCELED)
 
@@ -96,7 +96,25 @@ async def submit_array(service, request, *, owner_username, is_admin, idempotenc
         request.job, owner_username=owner_username, is_admin=is_admin
     )
     prepared = request.model_copy(update={"job": base})
-    specs = [(element.index, prepared.element_spec(element)) for element in request.elements]
+    # Source/assets are resolved once, but every model override must independently
+    # resolve against the registered catalogue before any child is committed.
+    specs = []
+    for element in request.elements:
+        spec = prepared.element_spec(element)
+        if (
+            "model" in element.model_fields_set
+            and spec.model is not None
+            and request.job.resources.min_vram_gb == 0
+            and (
+                element.resources is None or "min_vram_gb" not in element.resources.model_fields_set
+            )
+        ):
+            # An automatically selected base footprint is not a user-requested
+            # override for a different model. Resolve that child's own default.
+            spec = spec.model_copy(
+                update={"resources": spec.resources.model_copy(update={"min_vram_gb": 0})}
+            )
+        specs.append((element.index, service._resolve_model(spec)))
     if sum(len(spec.model_dump_json().encode()) for _, spec in specs) > 32 * 1024**2:
         raise AdmissionRejectedError("expanded array metadata exceeds 32 MiB; use smaller arrays")
     now = utc_now()
@@ -120,6 +138,41 @@ async def submit_array(service, request, *, owner_username, is_admin, idempotenc
             job.array_id, job.array_index = parent.id, index
         await session.flush()
         return await array_summary(session, parent)
+
+
+async def next_array_model(session, job):
+    """One advisory, exact checkpoint; never reserves or reorders a child."""
+    if job.array_id is None:
+        return None
+    current = JobSpec.model_validate(job.spec)
+    if current.model is None or current.execution_mode not in {"single", "model_sharded"}:
+        return None
+    from topodrome.db.job_ordering import queue_expressions
+
+    now = utc_now()
+    rank, estimate, submitted = queue_expressions(now)
+    rows = await session.scalars(
+        select(JobRow)
+        .where(
+            JobRow.array_id == job.array_id,
+            JobRow.owner_username == job.owner_username,
+            JobRow.id != job.id,
+            JobRow.state.in_((JobState.QUEUED, JobState.RETRY_WAIT)),
+            or_(JobRow.retry_not_before.is_(None), JobRow.retry_not_before <= now),
+        )
+        .order_by(rank.desc(), estimate.asc().nulls_last(), submitted, JobRow.id)
+        .limit(32)
+    )
+    for row in rows:
+        candidate = JobSpec.model_validate(row.spec)
+        if (
+            candidate.model is not None
+            and candidate.model.revision is not None
+            and candidate.model != current.model
+            and candidate.runtime_fingerprint == current.runtime_fingerprint
+        ):
+            return candidate.model
+    return None
 
 
 async def array_summary(session, row, *, counts=None, active=None):

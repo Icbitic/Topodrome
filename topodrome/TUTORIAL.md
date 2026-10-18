@@ -1,23 +1,53 @@
 # Topodrome tutorial
 
+Operator code/configuration releases can be queued with `topodrome upgrade queue
+/absolute/plan.yaml --pause targets|all|none`. An independent updater prepares the
+release, waits for affected computation and required I/O to finish, applies and
+verifies it, then resumes dispatch. Submissions stay open and running jobs are
+never preempted. `upgrade status` shows blockers; `upgrade cancel ID` is allowed
+before live mutation. See [idle-gated upgrades](docs/IDLE_UPGRADES.md) for protected
+plans, scope, the separate runner and crash/rollback safety.
+
 `top` shows only nonterminal interactive kernels (including idle/start/stop
 transitions). Freed rows expand the jobs table. Running/assigning/canceling jobs
 come first, then queued and retry-wait jobs, then completed history if space
 remains. These display priorities do not change scheduling or delete history.
 
-Remote-storage administration: when the site's rclone remote maps to Lab1's
-scheduler global root, set `rclone.verification_via_scheduler: true` after
-upgrading the scheduler and site agent. Upload verification then hashes the
-stored bytes on Lab1 and returns only SHA-256 and size, avoiding a full download
-back to the producing site. Site enrollment authentication is required; failures
-still prevent completion. AutoDL bootstrap bundles always enable this option for their Lab1 global mirror.
-Other storage authorities retain rclone read-back.
-Do not restart an agent with an active job to activate this setting.
+Remote-storage administration: remote agents configure `storage` and use
+HTTP for tiny files, resumable large files, metadata, directories and independent
+authority verification. Lab1 uses its native path. No external transfer tool,
+configuration or FUSE mount is required. Small transfers have persistent bounded
+connections; large streams and checksummed prefix uploads have isolated pools.
+When routed through SSH, use separate owned control and bulk forwards so bulk
+loss/congestion does not monopolize the control connection.
+SSH bulk routes may opt into measured `storage.bulk_reconnect` renewal. It
+compares a fresh direct connection before switching new requests, while open
+streams drain and running computation remains untouched. Reconnection does
+not guarantee a different network route; see the transport guide below.
+No integrity/authentication failure silently switches protocols.
+
+`storage.small_file_max_bytes` defaults to 1 MiB (maximum 4 MiB; zero uses HTTP
+streaming throughout). Completion still requires authority-observed durable
+bytes, not merely receipt or 100% progress. Inputs verify exact content pins;
+unfinished user output is not uploaded while code still changes it.
+Transport configuration requires idle-gated service/agent deployment, not a
+scheduling policy reload. Never restart with active computation, staging or
+pending finalization/outbox delivery. Models and scratch remain separate.
+See [HTTP transport and validation](docs/HTTP_TRANSPORT.md).
 
 This walkthrough uses the deployed Topodrome control plane on Lab1. Run the
 commands on Lab1. The installed `topodrome` command and the project-local
 `uv run topodrome` command are equivalent; examples below use the installed
 command for brevity.
+
+The current institutional suppliers are `lab1` and `sqz-128` (two A800 80-GB
+GPUs). SQZ-128 uses the existing four-model cache and an isolated agent/runtime
+under `/cephfs/tianhaolin/sxk`; all its managed storage and scratch stay under
+that directory. The superseded `remote-jupyter-1`, `sqz`, and `sqz2` registrations
+are retired, not renamed or deleted: their historical jobs and files are
+preserved, their enrollment credentials are revoked, and they cannot rejoin or
+receive assignments. Ordinary offline suppliers still appear in Sites with
+their GPUs hidden.
 
 ### Access from a whitelisted server account
 
@@ -71,6 +101,14 @@ topodrome models
 topodrome autodl
 ```
 
+To discover the registered training checkpoints for one repository, use
+`topodrome models --repo EleutherAI/pythia-160m`. Results include the exact commit,
+registered `refs` such as `step20000`, `is_default`, and per-site availability.
+Use a returned label in `model.revision`; no Hugging Face lookup is needed.
+Both Python clients offer `models(repo_id=...)`. Deduplicate repeated site/replica
+rows by repository, revision and subfolder before generating a sweep. See
+[model addresses](docs/MODEL_ADDRESSES.md#discover-checkpoint-labels) for details.
+
 ### Interactive workbench
 
 On a terminal, `topodrome top` opens the Textual workbench (`topodrome[ui]`).
@@ -78,7 +116,7 @@ Use `top --plain` for the previous text monitor; `top --once` is unchanged.
 Without a terminal, ordinary `top` prints one snapshot and exits.
 
 Use `←`/`→` to switch tabs directly from the list; they wrap at either end.
-`1` Jobs, `2` GPUs, `3` Sites, `4` Assets, `5` Reservations, and `6` AutoDL
+`1` Jobs, `2` GPUs, `3` Sites, `4` Assets, `5` Reservations, `6` AutoDL, and `7` System
 also switch directly to a view. `?` opens shortcut help; `Esc` closes it. Number
 shortcuts are inactive while typing in inputs or confirming an action; arrows
 retain normal text editing and dialog controls there.
@@ -86,7 +124,24 @@ Inside job details, the visible navigation is `1` Summary, `2` Attempts, and `3`
 Logs. Other resource details show a curated summary only, with no raw API dumps.
 `←`/`→` cycles these detail tabs without leaving the selected resource.
 These shortcuts focus the selected content for scrolling; `Esc` returns
-to the main views, where `1–6` select Jobs through AutoDL again.
+to the main views, where `1–7` select Jobs through System again.
+
+**System** is a read-only operator view of the active central store: allocated
+file bytes (hardlinks counted once), category breakdown, filesystem free space,
+and estimated cleanup eligibility now and within one day. The one-day total
+includes already eligible data; a separate row shows newly eligible bytes.
+These are estimates using current references and the actual retention rules,
+not guaranteed deletions. Published assets, live work and recovery/input pins
+remain protected; automatic cleanup can be disabled or limited per pass.
+Remote caches, external models, archived stores outside the active root and
+external database storage are **not** included. Host filesystem free space is
+shared with other applications. Sparse files use allocated, not logical, bytes.
+The background storage sample is cached for five minutes; service uptime,
+database/schema health, connected agents, policy state, RSS and host load refresh
+with the view. Failed samples retain their previous values marked stale;
+unknown estimates display `—`, not zero. `Enter` explains a metric. Merely opening
+or refreshing the tab never starts cleanup. An older scheduler without the
+diagnostics endpoint displays an unavailable notice until safely upgraded.
 
 The Jobs tab defaults to active work, including queued jobs and retries. It
 preserves server queue ordering. `h` toggles terminal history within the bounded
@@ -201,11 +256,17 @@ upgrade during an idle window, but no site-agent restart. Install the UI extra
 with `uv sync --extra ui` in a development checkout,
 or install the CLI with `uv tool install '/path/to/topodrome[ui]'`.
 
-The scheduler first prefers clean compatible Lab1 or remote-Jupyter GPUs,
+The scheduler first prefers clean compatible institutional GPUs (Lab1 or SQZ-128),
 then registered AutoDL capacity, then GPUs with foreign processes where sharing is explicitly enabled (light before heavy). `scheduling.prefer_autodl_over_foreign_processes: true` enables this
 ordering. Topodrome does not rent capacity when no site is eligible; those jobs remain queued. In the GPU table, `leased` and `warm` are
 Topodrome-owned; `foreign` means unrelated CUDA work is present; `reserved`
 means an explicit external reservation.
+
+If an agent disconnects or its connection changes before an assignment is sent,
+the scheduler requeues that proven-unsent offer immediately instead of waiting
+for its timeout. The job keeps its ID, staged inputs and failure budget. A send
+failure with unknown receipt still waits for acceptance or expiry to prevent
+duplicate execution; running work is never revoked by this recovery.
 
 An operator can validate and stage a changed scheduling policy without
 restarting the service:
@@ -214,7 +275,59 @@ restarting the service:
 topodrome policy-reload
 ```
 
-Changing only `scheduling.prefer_autodl_over_foreign_processes`, model
+### Operator: live site preference
+
+In `topodrome top`, go to **Sites** (`3` or the arrow keys). Use **↑↓** to select
+a site, then **Space** to pick it up: a `↕` marker appears, and ordinary **↑↓**
+moves that site. **Space** drops it so you can select another. **Enter** saves
+the order; **Esc** cancels. No modifier keys, new tab, editor screen, or extra
+review are required. **Shift+↑↓** remains an optional direct shortcut when your
+terminal forwards it.
+
+For mouse controls, click a site, then **Reorder sites** in its details. This
+returns to the same table with inline **↑ Up / ↓ Down** and **Save / Cancel**.
+Moving/selecting rows alone never saves. Clicking a row during reordering drops
+the picked-up site and selects the clicked row; press Space to move that one.
+
+Starting a reorder clears the filter so all registered sites are visible.
+Existing explicit preferences come first; an unranked site is an automatic
+fallback. Reordering ranks the complete captured list. Offline sites stay in
+the list and are skipped until eligible. Newly registered/unlisted sites remain
+automatic fallbacks. **Auto**, then **Enter** or **Save**, clears the entire
+order and restores measured-cost placement. Leaving the Sites tab discards
+unsaved edits; background refresh does not overwrite a draft. A concurrent
+policy edit disables Save: cancel, refresh, and reorder again. The Sites table
+follows the saved order and its **Pref** column shows ranks (`#1` first).
+These are operator-only actions; they take effect live and persist across
+scheduler restarts. Reopen an existing workbench to load new UI controls.
+
+Equivalent CLI commands:
+
+```bash
+topodrome site-preference                    # inspect the active order
+topodrome site-preference sqz-128             # SQZ first; other sites are fallbacks
+topodrome site-preference sqz-128 lab1        # explicit first and second choices
+topodrome site-preference --automatic        # restore automatic placement
+```
+
+Preference ranks **eligible** sites within the same contention/cost band. It
+never bypasses reservations, foreign-process exclusions, model/GPU/host-memory
+requirements, or job affinity. A preferred site can replace an incompatible
+idle actor, but never a busy one. If it has no eligible capacity, fallback is
+immediate rather than waiting for it. Clean institutional GPUs still precede
+paid capacity. Job priority, array limits, and starvation protection are unchanged.
+Running jobs, leases and input transfers already in progress are not moved.
+Concurrent edits use a policy generation check; a conflict requires refreshing
+and explicitly retrying, not an automatic mutation retry.
+
+The API is `PUT /api/v1/policy/site-preference` with `preferred_site_ids` and
+the current `expected_generation` from `/api/v1/status` → `policy`.
+An empty list restores automatic placement. Unknown or retired sites are
+rejected; an offline registered site can remain preferred for when it returns.
+If `scheduling.preferred_site_ids` is omitted from YAML, ordinary policy reloads
+preserve the live order. An explicit YAML value (including `[]`) replaces it.
+
+Changing only `scheduling.prefer_autodl_over_foreign_processes`, `preferred_site_ids`, model
 startup-cost estimates, and/or removing sites from
 `scheduling.foreign_capacity_sharing_site_ids` activates at the
 next dispatch boundary without waiting for running jobs or changing their
@@ -236,20 +349,52 @@ content-addressed sources are unaffected by a later limit change.
 
 ## 2. Submit the one-GPU Llama example
 
-Idle model actors expire after five minutes on Lab1 and JupyterLab, and twenty
-minutes on SQZ. Active jobs are never interrupted. The queue-active last-actor
+Idle model actors expire after one minute on Lab1 and twenty minutes on
+SQZ-128. Active jobs are never interrupted. The queue-active last-actor
 protection still applies. Operators configure overrides in scheduler YAML:
 
 ```yaml
 scheduling:
   institutional_warm_actor_idle_timeout_seconds: 1200
   institutional_warm_actor_idle_timeout_seconds_by_site:
-    lab1: 300
-    remote-jupyter-1: 300
+    lab1: 60
 ```
 
 `topodrome policy-reload` applies per-site timeout changes live without draining
 running jobs. Omitted sites inherit the default timeout.
+
+### Operator: suppliers that reclaim idle GPUs
+
+Only an explicitly opted-in supplier runs cooperative
+idle compute, including when the global queue is empty. This is not a fake job
+or a model actor: a child per idle GPU performs bounded FP16 GEMMs (4096-square,
+approximately 96 MiB of tensors plus its CUDA context). Real jobs retain
+priority and the helper is stopped before physical admission. A live, proven
+idle warm actor may remain resident while the helper runs.
+SQZ-128 is explicitly opted in on both A800 GPUs, including when the queue is
+empty. Other suppliers remain disabled unless explicitly enabled. Helpers
+inherit the site's approved temporary/cache paths, never its enrollment tokens.
+
+```yaml
+# Site YAML; disabled everywhere unless explicitly enabled.
+idle_compute:
+  enabled: true
+  matrix_size: 4096
+  minimum_free_vram_gb: 2
+  poll_interval_seconds: 1
+```
+
+Helpers self-exit when an unknown CUDA process appears, and never signal other
+users' processes. Active leases, non-idle actors, draining, external locks and
+Topodrome reservations prevent idle load. Reservation changes reach helpers on
+the next heartbeat (normally within five seconds). Scheduler permission expires
+after at most 15 seconds; the child also requires a parent renewal every three
+seconds and stops on parent pipe closure. Provider idle-reclamation rules remain
+provider-specific; this feature cannot guarantee a lease is retained.
+
+Suppliers sharing a filesystem must still use separate spool, lease database,
+finalization journal, input cache, scratch, tunnel records and Ray state. Share
+immutable model files and dependency packages, not mutable site authority.
 
 ### Operator: manual AutoDL capacity and release
 
@@ -354,6 +499,12 @@ job ID and use `topodrome logs JOB_ID` again if final output is still arriving.
 
 ## 3. Write and submit a job
 
+Need GPUs but no preloaded model? Use explicit `model: null` and declare positive
+per-GPU peak `resources.min_vram_gb`. The full context remains available, with
+`context.model/tokenizer = None` and actual assigned `torch.device` objects in
+`context.device`/`context.devices`. Read [model-free GPU jobs](docs/MODEL_FREE_JOBS.md)
+for single-process gangs, native distributed workers and runnable examples.
+
 Give jobs optional human-readable metadata in the YAML:
 
 ```yaml
@@ -370,6 +521,13 @@ Metadata is fixed at submission and does not change scheduling, actor reuse,
 or retry behavior. Keep using the returned `job_id` for commands and assets.
 
 ### Job arrays
+
+Arrays can sweep different registered models or revisions using per-element
+`model` overrides, with independently pinned inputs, retries and outputs. Omitted
+model inherits; explicit `model: null` means a model-free GPU job. Compatible idle
+workers can switch checkpoint weights without a new process; bounded read-ahead
+uses existing local files without extra disk copies. See
+[checkpoint sweep examples and worker behavior](docs/JOB_ARRAYS.md#checkpoint-sweeps-and-different-models).
 
 Use arrays for independent shards, seeds and parameter sweeps:
 
@@ -449,17 +607,23 @@ def run(context, *, prompt: str) -> dict[str, str]:
 
 Save that as `my_job/run.py` and add `my_job/job.yaml`:
 
-The cross-site deployment model aliases are
-`meta-llama-3-8b-instruct`, `gemma-3-12b-it`,
-`olmo-2-1124-7b-instruct`, and `qwen3-4b-instruct-2507`.
+The cross-site deployment model repository IDs are
+`meta-llama/Meta-Llama-3-8B-Instruct`, `google/gemma-3-12b-it`,
+`allenai/OLMo-2-1124-7B-Instruct`, and `Qwen/Qwen3-4B-Instruct-2507`.
 Each supports an ordinary one-GPU request. Llama-70B is additionally enabled
 for Lab1 only as of 2026-09-16. Use
 `examples/model_summary_llama70b.yaml`; Jupyter and AutoDL remain unsupported.
 
+Use `model: {repo_id: owner/repository, revision: registered-checkpoint}` for an
+explicit registered checkpoint; optionally select a registered `subfolder`.
+Omitting revision pins the registered default at submission. Unknown repositories
+or snapshots are rejected; old aliases and `model.alias` are not accepted.
+See [model addressing](docs/MODEL_ADDRESSES.md) for checkpoint labels and URLs.
+
 ```yaml
 source_dir: .
 entrypoint: run.py
-model: meta-llama-3-8b-instruct
+model: meta-llama/Meta-Llama-3-8B-Instruct
 resources:
   gpu: 1
   min_vram_gb: 15
@@ -521,6 +685,21 @@ from one producer job, not a native multi-job collection.
 
 ### Tag and delete assets without a GPU
 
+`topodrome assets` shows only the most recently published surviving version of
+each asset name, separately for private and shared namespaces. Publication time,
+not version-label ordering, defines latest (ties use reference ordering).
+Use `topodrome assets --all-versions` for history. In `top`'s Assets page,
+select an asset and press **Space** or click its disclosure arrow to expand
+older versions beneath it. Each asset expands independently; **Space** on an
+older version collapses its parent, and **Enter** opens that exact version's
+details. History metadata is fetched on expansion (up to 1,000 versions across
+assets, with an explicit limit notice); payload files are not downloaded.
+`h` remains a Jobs-only history shortcut. Both Python clients accept
+`assets(all_versions=True)`; the API accepts `all_versions=true`.
+Latest selection precedes tag filters and the result limit, so an older tagged
+version is not presented as latest. Use history to search older tagged versions.
+No stored versions are removed, and exact references/downloads remain unchanged.
+
 ```bash
 topodrome asset-tags tuned-lens v1 --add project:retrieval --add kind:lens
 topodrome assets --tag project:retrieval --tag kind:lens
@@ -553,35 +732,47 @@ visibility="private")`. Await async calls. HTTP uses `PATCH /api/v1/assets/
 query parameters on `GET /api/v1/assets`, and `DELETE /api/v1/assets/{name}/{version}`;
 mutation routes accept the `visibility` query parameter.
 
-### Download, edit, and upload assets without a GPU job
+### Download job outputs or assets without a GPU job
 
-Download a named asset's actual files to a new local destination:
+Download a committed job file/tree directly, or retrieve a named asset using
+the same command:
 
 ```bash
-topodrome asset-download tuned-lens v1 ./edited-lens
+topodrome download 'job://JOB_ID/results/' ./results
+topodrome download 'job://JOB_ID/results/metrics.json' ./metrics.json
+topodrome download 'asset://private/tuned-lens@v1' ./edited-lens
 # Edit ./edited-lens locally, then publish a new version:
 topodrome asset-upload tuned-lens v2 ./edited-lens
 ```
 
 For a directory asset, the destination becomes a directory containing its
 members; for a file asset, the destination is the exact output filename.
-The destination must not already exist. Use `--shared` to read a shared asset;
-private downloads are limited to the authenticated owner's namespace.
-Both job-published and directly uploaded assets can be downloaded. For unnamed
-committed job outputs, first use metadata-only `asset-publish` to give the
-desired file/tree a name; neither publication nor download needs a GPU.
-For a download-only request, use a unique temporary private reference and remove
-it with `asset-delete` after the download succeeds and verifies. Keep it if the
-download fails; do not delete a pre-existing or intentionally permanent asset.
+The destination must not already exist. Use `asset://shared/name@version` to
+read a shared asset; private assets and job outputs require the appropriate
+owner access. `JOB_ID` is the full ID, and the path must select registered,
+durably committed outputs of a succeeded job. Both uploaded and job-published
+assets work. No temporary asset registration is needed for a download.
 
-The sync/async SDK provides `client.download_asset(name, version, destination,
-visibility="private")`, returning a local `Path` (await the async version).
-Downloads stream multi-GiB bodies, verify every member's size/SHA-256 against
-the immutable catalog, and expose an editable copy only after verification.
-Truncated, corrupted, and interrupted downloads do not leave a completed
-destination; their private staging directory is cleaned. Retrying restarts
-from byte zero; automatic byte-range resume is not yet implemented. Downloads
-do not create jobs, load models, or acquire GPU leases.
+The sync/async SDK provides `client.download(reference, destination)`, returning
+a local `Path` (await the async version). Downloads stream multi-GiB bodies,
+verify every member's size/SHA-256, and expose an editable copy only after
+verification. Interrupted downloads keep a private
+`.topodrome-download-<destination-key>` directory beside the destination;
+rerun the same command to resume missing bytes, not restart the whole transfer.
+Concurrent downloads into that staging tree are rejected. Corrupted data is
+never accepted as complete. If content/server identity changes, choose a new
+destination; do not overwrite or delete unrelated files to retry.
+
+While downloading, a short-lived server reference protects the selected bytes
+from GC, including across scheduler restarts. It renews during active transfer,
+expires after 15 minutes without renewal, and has a 24-hour absolute lifetime.
+Clients release it on completion or error. After a long interruption, the
+ordinary artifact retention may expire; download before that deadline.
+Downloading does not make server outputs permanent, create jobs, load models,
+or acquire GPU leases. To retain results permanently on the server, publish an
+asset explicitly. The older `asset-download NAME VERSION DESTINATION [--shared]`
+and `download_asset` SDK method remain available, without unified byte-range
+resume; prefer `download` for new workflows.
 
 Upload an existing local file or directory directly:
 
@@ -622,7 +813,8 @@ version and real SHA-256 hash derived from project lock data. Do not invent
 hashes or run an unpinned installer inside the entry point.
 
 Submission does not automatically download committed artifacts. To retrieve
-them without another job, use `asset-publish` followed by `asset-download`.
+them without another job or asset registration, use
+`topodrome download 'job://JOB_ID/committed-path' ./local-copy`.
 If an automated caller needs a small
 immediate result, print a non-sensitive summary for `topodrome logs` and also
 commit the complete result as an artifact or reusable asset.
@@ -728,7 +920,7 @@ parallelism shape, with degree equal to `resources.gpu`:
 
 ```yaml
 model:
-  alias: meta-llama-3-8b-instruct
+  repo_id: meta-llama/Meta-Llama-3-8B-Instruct
   parallelism:
     mode: distributed
     degree: 2
@@ -755,7 +947,7 @@ with Client() as client:
     job = client.submit(
         source_dir="my_job",
         entrypoint="run.py",
-        model="meta-llama-3-8b-instruct",
+        model="meta-llama/Meta-Llama-3-8B-Instruct",
         resources={"gpu": 1, "min_vram_gb": 15},
         kwargs={"prompt": "Hello from the SDK"},
         required_outputs=["result.json"],
@@ -775,7 +967,7 @@ Request a one-GPU interactive Llama session:
 
 ```bash
 topodrome kernel \
-  --model meta-llama-3-8b-instruct \
+  --model meta-llama/Meta-Llama-3-8B-Instruct \
   --gpus 1 \
   --min-vram-gb 15
 ```
@@ -790,7 +982,7 @@ For a forced two-GPU sharded session:
 
 ```bash
 topodrome kernel \
-  --model meta-llama-3-8b-instruct \
+  --model meta-llama/Meta-Llama-3-8B-Instruct \
   --gpus 2 \
   --min-vram-gb 12 \
   --max-memory-per-gpu 10
@@ -839,7 +1031,7 @@ diagnostic that must run at one site, add both fields to its manifest:
 
 ```yaml
 portability: site-affine
-affinity_site_id: remote-jupyter-1
+affinity_site_id: sqz-128
 ```
 
 Valid deployed IDs are shown by `topodrome sites`. Avoid affinity in normal
@@ -948,7 +1140,7 @@ returns. For example, `upload 50% 1.0GiB/2.0GiB` shows aggregate artifact bytes,
 followed by `verify`, `manifest`, `checkpoint`/`ckpt-upload`, and `logs` phases.
 Upload percentage is not job completion: authoritative verification and the final
 manifest are still required. Local/native storage reports verification rather than
-network upload; byte-level upload statistics are available for rclone mirror sites.
+network upload; byte-level upload statistics are available for HTTP mirror sites.
 The final log stays unchanged while it is uploaded, so its `logs` phase has no
 byte counter. No experiment changes are needed. Older, already-running agents
 retain their behavior until their next safe upgrade.

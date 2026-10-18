@@ -50,7 +50,7 @@ async def array_service(database, tmp_path, pre_staged_inputs):
     spec = JobSpec(
         entrypoint="experiment.py",
         source_ref=_source_ref(service),
-        model={"alias": "model", "revision": "rev"},
+        model={"repo_id": "test/model", "revision": "rev"},
         resources={"gpu": 1, "min_vram_gb": 15},
         name="sweep",
     )
@@ -208,7 +208,7 @@ async def test_aged_jobs_override_new_priority_with_stable_pagination(database):
                 session,
                 JobSpec(
                     entrypoint="run.py",
-                    model="model",
+                    model="test/model",
                     name=name,
                     priority=priority,
                     estimated_runtime_seconds=runtime,
@@ -255,7 +255,7 @@ def test_array_validation_and_index_parsing():
     for invalid in ["1,1", "0-10000000", "4-0", "0-9:0", "-1", "$(whoami)"]:
         with pytest.raises(ValueError):
             parse_indices(invalid)
-    spec = JobSpec(entrypoint="run.py", model="model")
+    spec = JobSpec(entrypoint="run.py", model="test/model")
     with pytest.raises(ValueError):
         JobArraySpec(job=spec, elements=[{"index": 0}, {"index": 0}])
     with pytest.raises(ValueError):

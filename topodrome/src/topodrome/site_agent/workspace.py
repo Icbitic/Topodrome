@@ -16,7 +16,7 @@ class WorkspaceStorage(Protocol):
 
     def healthcheck(self) -> bool: ...
 
-    def resolve(self, logical_path: str) -> Path: ...
+    def resolve_writable(self, logical_path: str) -> Path: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -66,7 +66,9 @@ class WorkspaceManager:
         if self._storage is not None:
             if not self._storage.healthcheck():
                 raise RuntimeError("global experiment filesystem is unavailable")
-            job_root = self._storage.resolve(f"jobs/{job_id}")
+            # Resolving an input tree may return a separate immutable cache.
+            # Workspaces must use the canonical path consumed by the uploader.
+            job_root = self._storage.resolve_writable(f"jobs/{job_id}")
         else:
             assert self._global_root is not None
             global_root = self._global_root.resolve()

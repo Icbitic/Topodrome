@@ -158,7 +158,7 @@ def actor_key() -> ActorKey:
         site_id="lab1",
         gpu_uuid="GPU-abcd:1234",
         model=ModelKey(
-            alias="llama",
+            repo_id="test/llama",
             revision="exact",
             backend="test",
             backend_version="1",

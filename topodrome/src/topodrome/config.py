@@ -13,6 +13,8 @@ from pydantic import BaseModel, Field, SecretStr, field_validator, model_validat
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from topodrome.domain.enums import SiteKind
+from topodrome.domain.model_address import validate_repo_id, validate_revision, validate_subfolder
+from topodrome.domain.scheduling import validate_preferred_sites
 from topodrome.source_limits import SourceLimits
 
 
@@ -135,6 +137,10 @@ class SchedulingPolicySettings(BaseModel):
     # fast.  That fail-closed default prevents an omitted classification from
     # causing paid AutoDL capacity to outrank an institutional GPU.
     fast_gpu_name_patterns: tuple[str, ...] = ()
+    # Ordered operator preference within a safety/cost band. Empty restores
+    # automatic, measured-cost placement. Never an affinity or a reservation.
+    preferred_site_ids: tuple[str, ...] = ()
+    _valid_preferred_sites = field_validator("preferred_site_ids")(validate_preferred_sites)
     # Blocking foreign processes make a GPU ineligible unless the operator has
     # explicitly declared that the named site safely supports capacity sharing.
     # This must agree with the corresponding site-agent admission policy; the
@@ -328,6 +334,7 @@ class SchedulerSettings(BaseSettings):
     database_dsn: str = "postgresql+asyncpg://topodrome@127.0.0.1/topodrome"
     api_host: str = "127.0.0.1"
     api_port: int = 8042
+    api_keepalive_seconds: int = Field(default=300, ge=5, le=3600)
     public_url: str = "http://127.0.0.1:8042"
     # Backwards-compatible local development remains usable, but this mode is
     # constrained to loopback listeners and origins. Any deployable/non-loopback
@@ -427,23 +434,6 @@ class SchedulerSettings(BaseSettings):
         return cls(**raw)
 
 
-class RcloneSettings(BaseModel):
-    # Enable only when this remote is the scheduler's authoritative global root.
-    verification_via_scheduler: bool = False
-    mode: Literal["mount", "mirror"] = "mount"
-    mountpoint: Path
-    remote: str
-    cache_dir: Path
-    binary: str = "rclone"
-    vfs_cache_max_size_gb: float = Field(default=20, gt=0)
-    min_free_space_gb: float = Field(default=10, gt=0)
-    write_back_seconds: float = Field(default=5, gt=0)
-    poll_interval_seconds: float = Field(default=5, gt=0)
-    startup_timeout_seconds: float = Field(default=30, gt=0)
-    verification_timeout_seconds: float = Field(default=120, gt=0)
-    transfer_timeout_seconds: float = Field(default=6 * 60 * 60, gt=0)
-
-
 class SSHLocalForwardSettings(BaseModel):
     """Protected outbound route from a remote site to the Lab1 scheduler."""
 
@@ -473,6 +463,50 @@ class SSHLocalForwardSettings(BaseModel):
         if not expanded.is_absolute():
             raise ValueError("SSH local-forward paths must be absolute")
         return expanded
+
+
+class BulkReconnectSettings(BaseModel):
+    """Opt-in, measured renewal of the direct bulk SSH route, not control."""
+
+    model_config = SettingsConfigDict(extra="forbid")
+    enabled: bool = False
+    candidate_port: int | None = Field(default=None, ge=1, le=65_535)
+    slow_mib_per_second: float = Field(default=1, gt=0, le=1024)
+    sustained_seconds: float = Field(default=30, ge=10, le=3600)
+    cooldown_seconds: float = Field(default=600, ge=60, le=86_400)
+    min_speedup: float = Field(default=1.5, ge=1.2, le=10)
+    probe_timeout_seconds: float = Field(default=5, ge=1, le=15)
+
+
+class HttpStorageSettings(BaseModel):
+    """Explicit remote mirror using one authenticated HTTP authority."""
+
+    bulk_url: str | None = None
+    # Preserve the old mirror's journal key during an idle protocol switch.
+    # This is an opaque authority ID, not a URL or a transport configuration.
+    authority_id: str | None = Field(default=None, min_length=1, max_length=4096)
+    small_file_max_bytes: int = Field(default=1024**2, ge=0, le=4 * 1024**2)
+    min_free_space_gb: float = Field(default=10, gt=0)
+    request_timeout_seconds: float = Field(default=30, gt=0, le=300)
+    verification_timeout_seconds: float = Field(default=120, gt=0)
+    transfer_timeout_seconds: float = Field(default=6 * 60 * 60, gt=0)
+    healthcheck_cache_seconds: float = Field(default=5, ge=0)
+    bulk_reconnect: BulkReconnectSettings = Field(default_factory=BulkReconnectSettings)
+
+    @field_validator("bulk_url")
+    @classmethod
+    def _secure_bulk_url(cls, value: str | None) -> str | None:
+        return None if value is None else SiteSettings._secure_scheduler_url(value)
+
+
+class IdleComputeSettings(BaseModel):
+    """Opt-in, cooperative GPU activity for an idle-reclaimed supplier."""
+
+    model_config = SettingsConfigDict(extra="forbid")
+    enabled: bool = False
+    matrix_size: int = Field(default=4096, ge=512, le=4096)
+    minimum_free_vram_gb: float = Field(default=2, ge=1, le=16)
+    poll_interval_seconds: float = Field(default=1, ge=0.25, le=2)
 
 
 class SiteSettings(BaseSettings):
@@ -522,9 +556,13 @@ class SiteSettings(BaseSettings):
         ge=60,
         le=604_800,
     )
+    idle_compute: IdleComputeSettings = Field(default_factory=IdleComputeSettings)
     light_contention_utilization_percent: float = Field(default=10, ge=0, le=100)
     checkpoint_grace_seconds: float = 30
     checkpoint_keep_snapshots: int = Field(default=2, ge=2, le=1000)
+    checkpoint_prefetch_max_bytes: int = Field(default=16 * 1024**3, ge=0, le=64 * 1024**3)
+    checkpoint_prefetch_concurrency: int = Field(default=1, ge=1, le=4)
+    checkpoint_prefetch_memory_floor_bytes: int = Field(default=16 * 1024**3, ge=0)
     # Explicit user cancellation is bounded independently of a job's
     # checkpoint policy. A submitted workload cannot extend this operator
     # safety limit through its raw specification.
@@ -539,8 +577,9 @@ class SiteSettings(BaseSettings):
     # it off only for trusted, immutable model trees that were preseeded out of
     # band; acquired and staged payloads retain their independent verification.
     verify_preseeded_model_hashes: bool = True
-    rclone: RcloneSettings | None = None
+    storage: HttpStorageSettings | None = None
     ssh_local_forward: SSHLocalForwardSettings | None = None
+    bulk_ssh_local_forward: SSHLocalForwardSettings | None = None
 
     @field_validator("scheduler_url")
     @classmethod
@@ -578,8 +617,6 @@ class SiteSettings(BaseSettings):
 
     @model_validator(mode="after")
     def _scheduler_uses_configured_local_forward(self) -> SiteSettings:
-        if self.storage_layout == "blobs-v1" and self.rclone and self.rclone.mode == "mount":
-            raise ValueError("blobs-v1 requires native storage or rclone mirror mode")
         tunnel = self.ssh_local_forward
         if tunnel is None:
             return self
@@ -595,17 +632,56 @@ class SiteSettings(BaseSettings):
         return self
 
     @model_validator(mode="after")
-    def _global_root_matches_rclone_namespace(self) -> SiteSettings:
-        if self.rclone is not None and (
-            self.global_root.expanduser().absolute()
-            != self.rclone.mountpoint.expanduser().absolute()
-        ):
-            raise ValueError("global_root must equal the managed rclone namespace")
+    def _http_storage_routes(self) -> SiteSettings:
+        bulk = self.bulk_ssh_local_forward
+        control = self.ssh_local_forward
+        if self.storage is None and bulk is not None:
+            raise ValueError("bulk SSH forwarding requires HTTP storage")
+        if self.storage is not None and control is not None and bulk is None:
+            raise ValueError("HTTP storage over SSH requires a separate bulk SSH forward")
+        if bulk is not None:
+            if control is None or self.storage is None or self.storage.bulk_url is None:
+                raise ValueError("bulk forwarding requires a control route and storage.bulk_url")
+            endpoint = urlsplit(self.storage.bulk_url)
+            if (
+                endpoint.scheme not in {"http", "ws"}
+                or endpoint.hostname != bulk.local_host
+                or endpoint.port != bulk.local_port
+            ):
+                raise ValueError("storage.bulk_url must match the bulk SSH forward")
+            if (
+                bulk.local_port == control.local_port
+                or bulk.state_directory == control.state_directory
+            ):
+                raise ValueError(
+                    "bulk/control forwards require separate ports and state directories"
+                )
+            if (
+                bulk.remote_host,
+                bulk.remote_user,
+                bulk.remote_port,
+                bulk.target_host,
+                bulk.target_port,
+            ) != (
+                control.remote_host,
+                control.remote_user,
+                control.remote_port,
+                control.target_host,
+                control.target_port,
+            ):
+                raise ValueError("bulk/control forwards must reach the same storage authority")
+        if self.storage is not None and self.storage.bulk_reconnect.enabled:
+            renewal = self.storage.bulk_reconnect
+            if bulk is None or renewal.candidate_port is None:
+                raise ValueError("bulk reconnection requires an SSH bulk route and candidate_port")
+            if renewal.candidate_port in {bulk.local_port, control.local_port}:
+                raise ValueError("bulk candidate_port must be distinct from bulk/control ports")
         return self
 
     @classmethod
     def from_yaml(cls, path: Path | str) -> SiteSettings:
         raw = _read_yaml(path)
+        validate_site_fields(raw)
         # An explicit YAML null is commonly used as a deployment placeholder,
         # but BaseSettings gives init values priority over environment values.
         # Drop null identity hints so protected bootstrap environment values
@@ -680,33 +756,126 @@ class SiteModelLocation(BaseModel):
         return self
 
 
-class ModelDefinition(BaseModel):
-    alias: str
+class ModelSnapshot(BaseModel):
+    """An operator-pinned snapshot; refs are labels, never mutable worker inputs."""
+
+    model_config = SettingsConfigDict(extra="forbid")
     revision: str
+    subfolder: str | None = None
+    refs: tuple[str, ...] = Field(default=(), max_length=1000)
+    sites: dict[str, SiteModelLocation]
+
+    _valid_revision = field_validator("revision")(validate_revision)
+    _valid_subfolder = field_validator("subfolder")(validate_subfolder)
+
+    @field_validator("refs")
+    @classmethod
+    def _valid_refs(cls, values: tuple[str, ...]) -> tuple[str, ...]:
+        if len(set(values)) != len(values):
+            raise ValueError("model snapshot refs must be unique")
+        return tuple(validate_revision(value) for value in values)
+
+    @model_validator(mode="after")
+    def _pinned_hub_origin(self) -> ModelSnapshot:
+        if any(location.origin is not None for location in self.sites.values()):
+            if re.fullmatch(r"[0-9a-f]{40,64}", self.revision) is None:
+                raise ValueError("Hub snapshots require a full commit revision; put labels in refs")
+        return self
+
+
+class ModelDefinition(ModelSnapshot):
+    repo_id: str
     backend: str = "transformers"
     backend_version: str = "configured"
     dtype: str = "bfloat16"
     quantization: str | None = None
-    min_vram_gb: float = 0
-    sites: dict[str, SiteModelLocation]
+    min_vram_gb: float = Field(default=0, ge=0, allow_inf_nan=False)
+    snapshots: tuple[ModelSnapshot, ...] = Field(default=(), max_length=1000)
+
+    _valid_repo = field_validator("repo_id")(validate_repo_id)
+
+    @model_validator(mode="after")
+    def _unambiguous_snapshots(self) -> ModelDefinition:
+        seen: set[tuple[str, str | None]] = set()
+        for snapshot in (self, *self.snapshots):
+            for revision in (snapshot.revision, *snapshot.refs):
+                identity = revision, snapshot.subfolder
+                if identity in seen:
+                    raise ValueError("model revisions/refs and subfolders must select one snapshot")
+                seen.add(identity)
+        return self
+
+    def variants(self) -> tuple[ModelDefinition, ...]:
+        default = self.model_copy(update={"snapshots": ()})
+        return (default, *(self.model_copy(update={
+            "revision": snapshot.revision, "subfolder": snapshot.subfolder,
+            "refs": snapshot.refs, "sites": snapshot.sites, "snapshots": (),
+        }) for snapshot in self.snapshots))
+
+
+def validate_site_fields(value: dict) -> None:
+    """Do not silently turn an unsupported remote configuration into native I/O."""
+    known = set(SiteSettings.model_fields)
+    known.update(field.alias for field in SiteSettings.model_fields.values() if field.alias)
+    unexpected = set(value) - known
+    if unexpected:
+        raise ValueError("unsupported site configuration fields: " + ", ".join(sorted(unexpected)))
 
 
 class ModelCatalog(BaseModel):
+    model_config = SettingsConfigDict(extra="forbid")
     models: dict[str, ModelDefinition]
+
+    @model_validator(mode="after")
+    def _matching_repository_keys(self) -> ModelCatalog:
+        if any(repo_id != definition.repo_id for repo_id, definition in self.models.items()):
+            raise ValueError("model catalogue keys must equal their registered repo_id")
+        paths: dict[tuple[str, str], tuple[str, str]] = {}
+        for variant in self.variants():
+            for site_id, location in variant.sites.items():
+                for path in (location.path, location.local_path, location.persistent_path):
+                    if path is None:
+                        continue
+                    key = site_id, str(path.expanduser().absolute())
+                    identity = variant.repo_id, variant.revision
+                    if key in paths and paths[key] != identity:
+                        raise ValueError(
+                            "different model snapshots cannot share a writable cache path"
+                        )
+                    paths[key] = identity
+        return self
 
     @classmethod
     def from_yaml(cls, path: Path | str) -> ModelCatalog:
         raw = _read_yaml(path)
         definitions: dict[str, ModelDefinition] = {}
-        for alias, value in raw.get("models", {}).items():
-            definitions[alias] = ModelDefinition(alias=alias, **value)
+        for repo_id, value in raw.get("models", {}).items():
+            definitions[repo_id] = ModelDefinition(repo_id=repo_id, **value)
         return cls(models=definitions)
 
-    def resolve(self, alias: str) -> ModelDefinition:
+    def variants(self) -> tuple[ModelDefinition, ...]:
+        return tuple(
+            variant for definition in self.models.values() for variant in definition.variants()
+        )
+
+    def resolve(
+        self, repo_id: str, *, revision: str | None = None, subfolder: str | None = None,
+    ) -> ModelDefinition:
         try:
-            return self.models[alias]
+            definition = self.models[repo_id]
         except KeyError as exc:
-            raise ValueError(f"unknown model alias: {alias}") from exc
+            raise ValueError(f"unregistered model repository: {repo_id}") from exc
+        if revision is None and subfolder is None:
+            return definition.variants()[0]
+        selected_revision = definition.revision if revision is None else revision
+        for variant in definition.variants():
+            if (selected_revision in (variant.revision, *variant.refs)
+                    and subfolder == variant.subfolder):
+                return variant
+        raise ValueError(
+            f"unregistered model snapshot: {repo_id}@{selected_revision}"
+            + (f":{subfolder}" if subfolder is not None else "")
+        )
 
 
 def load_secret_bundle(path: Path | str) -> SecretBundle:

@@ -22,7 +22,7 @@ def job_spec(
 ) -> JobSpec:
     return JobSpec(
         entrypoint="experiment.py",
-        model={"alias": "model", "revision": "rev"},
+        model={"repo_id": "test/model", "revision": "rev"},
         resources={
             "gpu": 1,
             "min_vram_gb": 15,
@@ -58,7 +58,7 @@ def heartbeat(
         ),
         models=(
             ModelCapability(
-                alias="model",
+                repo_id="test/model",
                 revision="rev",
                 backend="transformers",
                 backend_version="configured",
@@ -195,7 +195,7 @@ async def test_heartbeat_persists_site_authoritative_actor_idle_since(
             update={
                 "models": (
                     ModelCapability(
-                        alias="model",
+                        repo_id="test/model",
                         revision="rev",
                         backend="transformers",
                         backend_version="configured",
@@ -242,7 +242,7 @@ async def test_heartbeat_persists_shared_sharded_replica_identity(
     )
     models = tuple(
         ModelCapability(
-            alias="model",
+            repo_id="test/model",
             revision="rev",
             backend="transformers",
             backend_version="configured",
@@ -560,7 +560,7 @@ async def test_gang_renewal_rotates_atomically_and_runs_past_original_token_ttl(
     gang_spec = JobSpec(
         entrypoint="experiment.py",
         model={
-            "alias": "model",
+            "repo_id": "test/model",
             "revision": "rev",
             "parallelism": {
                 "mode": "model_sharded",
@@ -726,7 +726,7 @@ async def test_retry_policy_honors_max_attempts_and_retry_on(
             session,
             JobSpec(
                 entrypoint="experiment.py",
-                model={"alias": "model", "revision": "rev"},
+                model={"repo_id": "test/model", "revision": "rev"},
                 retry=retry,
             ),
         )

@@ -139,7 +139,7 @@ class ModelRegistry:
     def __init__(self, registrations: Iterable[ModelRegistration] = ()) -> None:
         self._lock = RLock()
         self._by_key: dict[ModelKey, ModelRegistration] = {}
-        self._by_alias: dict[str, set[ModelKey]] = {}
+        self._by_repo_id: dict[str, set[ModelKey]] = {}
         for registration in registrations:
             self.register(registration)
 
@@ -149,22 +149,22 @@ class ModelRegistry:
         with self._lock:
             if registration.key in self._by_key and not replace:
                 raise DuplicateModelError(
-                    f"model is already registered: {registration.key.alias!r} "
+                    f"model is already registered: {registration.key.repo_id!r} "
                     f"at revision {registration.key.revision!r}"
                 )
             self._by_key[registration.key] = registration
-            self._by_alias.setdefault(registration.key.alias, set()).add(registration.key)
+            self._by_repo_id.setdefault(registration.key.repo_id, set()).add(registration.key)
 
     def unregister(self, key: ModelKey) -> ModelRegistration:
         with self._lock:
             try:
                 registration = self._by_key.pop(key)
             except KeyError as exc:
-                raise UnknownModelError(key.alias) from exc
-            keys = self._by_alias[key.alias]
+                raise UnknownModelError(key.repo_id) from exc
+            keys = self._by_repo_id[key.repo_id]
             keys.discard(key)
             if not keys:
-                del self._by_alias[key.alias]
+                del self._by_repo_id[key.repo_id]
             return registration
 
     def get(self, key: ModelKey) -> ModelRegistration:
@@ -174,11 +174,11 @@ class ModelRegistry:
             try:
                 return self._by_key[key]
             except KeyError as exc:
-                raise UnknownModelError(key.alias) from exc
+                raise UnknownModelError(key.repo_id) from exc
 
     def resolve(
         self,
-        alias: str,
+        repo_id: str,
         *,
         revision: str | None = None,
         backend: str | None = None,
@@ -186,15 +186,17 @@ class ModelRegistry:
         dtype: str | None = None,
         quantization: str | None = None,
         adapter: str | None = None,
+        subfolder: str | None = None,
     ) -> ModelRegistration:
-        """Resolve an alias, refusing to guess when multiple exact keys match."""
+        """Resolve an repo_id, refusing to guess when multiple exact keys match."""
 
         with self._lock:
-            candidates = list(self._by_alias.get(alias, ()))
+            candidates = list(self._by_repo_id.get(repo_id, ()))
             candidates = [
                 key
                 for key in candidates
                 if (revision is None or key.revision == revision)
+                and key.subfolder == subfolder
                 and (backend is None or key.backend == backend)
                 and (backend_version is None or key.backend_version == backend_version)
                 and (dtype is None or key.dtype == dtype)
@@ -202,11 +204,11 @@ class ModelRegistry:
                 and (adapter is None or key.adapter == adapter)
             ]
             if not candidates:
-                raise UnknownModelError(alias)
+                raise UnknownModelError(repo_id)
             if len(candidates) != 1:
                 revisions = sorted({key.revision for key in candidates})
                 raise AmbiguousModelError(
-                    f"model alias {alias!r} is ambiguous; exact revision/backend "
+                    f"model repo_id {repo_id!r} is ambiguous; exact revision/backend "
                     f"is required (matching revisions: {revisions!r})"
                 )
             return self._by_key[candidates[0]]
@@ -225,7 +227,7 @@ class ModelRegistry:
             registrations = sorted(
                 self._by_key.values(),
                 key=lambda item: (
-                    item.key.alias,
+                    item.key.repo_id,
                     item.key.revision,
                     item.key.fingerprint,
                 ),

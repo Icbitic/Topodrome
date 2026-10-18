@@ -6,7 +6,8 @@ import gc
 import os
 import sys
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from contextlib import ExitStack
+from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
 from threading import Lock, RLock
@@ -18,6 +19,7 @@ from .cleanup import CleanupError
 from .context import ArtifactRegistration, ExperimentContext
 from .experiment import invoke_experiment
 from .model_key import ActorKey, ModelKey
+from .source_imports import source_imports
 
 
 class ActorState(StrEnum):
@@ -70,10 +72,12 @@ class LoadedModel:
     tokenizer: Any = None
     device: Any = "cuda"
     close: Callable[[], Any] | None = None
+    devices: tuple[Any, ...] | None = None
+    switch_state: Any = field(default=None, repr=False)
 
 
 class ModelLoader(Protocol):
-    def __call__(self, key: ModelKey) -> LoadedModel: ...
+    def __call__(self, key: ModelKey | None) -> LoadedModel: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -86,6 +90,9 @@ class ActorDescription:
     pending_runs: int
     dirty: bool
     dirty_reasons: tuple[str, ...]
+    supports_model_switch: bool = False
+    model_switches: int = 0
+    last_switch_kind: str | None = None
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -97,6 +104,9 @@ class ActorDescription:
             "pending_runs": self.pending_runs,
             "dirty": self.dirty,
             "dirty_reasons": list(self.dirty_reasons),
+            "supports_model_switch": self.supports_model_switch,
+            "model_switches": self.model_switches,
+            "last_switch_kind": self.last_switch_kind,
         }
 
 
@@ -132,6 +142,8 @@ class LocalModelActor:
         self._active_context: ExperimentContext | None = None
         self._pending_runs = 0
         self._executions = 0
+        self._model_switches = 0
+        self._last_switch_kind: str | None = None
         self._dirty_reasons: list[str] = []
         try:
             loaded = loader(key.model)
@@ -171,14 +183,65 @@ class LocalModelActor:
                 pending_runs=self._pending_runs,
                 dirty=bool(self._dirty_reasons),
                 dirty_reasons=tuple(self._dirty_reasons),
+                supports_model_switch=callable(getattr(self._loader, "replace", None)),
+                model_switches=self._model_switches,
+                last_switch_kind=self._last_switch_kind,
             )
+
+    def replace_model(self, key: ActorKey, loader: ModelLoader, *, expected: ActorKey) -> str:
+        """Switch only an exact clean idle worker; new identity follows full success."""
+        with self._state_lock:
+            if (
+                self.key != expected
+                or self._state is not ActorState.IDLE
+                or self._pending_runs
+                or self._dirty_reasons
+            ):
+                raise ActorUnavailableError("checkpoint replacement requires the exact idle actor")
+            if (
+                key.site_id != expected.site_id
+                or key.replica_gpu_uuids != expected.replica_gpu_uuids
+                or key.runtime_fingerprint != expected.runtime_fingerprint
+                or key.model is None
+                or expected.model is None
+                or not callable(getattr(self._loader, "replace", None))
+                or not callable(getattr(loader, "replace", None))
+            ):
+                raise ActorUnavailableError("checkpoint replacement changed worker resources")
+            self._state = ActorState.LOADING
+        with self._execution_lock:
+            try:
+                assert self._loaded is not None
+                switched = loader.replace(self._loaded, expected.model)  # type: ignore[attr-defined]
+                kind = "weights" if switched else "reload"
+                if not switched:
+                    old = self._loaded
+                    self._loaded = None
+                    if old.close is not None:
+                        old.close()
+                    del old
+                    gc.collect()
+                    loaded = loader(key.model)
+                    if not isinstance(loaded, LoadedModel):
+                        raise TypeError("model loader must return LoadedModel")
+                    self._loaded = loaded
+                with self._state_lock:
+                    self._loader = loader
+                    self.key = key
+                    self._model_switches += 1
+                    self._last_switch_kind = kind
+                    self._state = ActorState.IDLE
+                return kind
+            except BaseException:
+                with self._state_lock:
+                    self._dirty_reasons.append("checkpoint replacement failed")
+                self._dispose()
+                raise
 
     def _reserve(self) -> None:
         with self._state_lock:
             if self._state not in (ActorState.IDLE, ActorState.BUSY):
-                raise ActorUnavailableError(
-                    f"actor {self.key.model.alias!r} is {self._state.value}"
-                )
+                raise ActorUnavailableError(f"actor {self.actor_id!r} is {self._state.value}")
             if self._dirty_reasons:
                 raise ActorUnavailableError("actor has uncertain model state")
             self._pending_runs += 1
@@ -202,6 +265,9 @@ class LocalModelActor:
         checkpoint_interval_seconds: float | None = None,
         checkpoint_restore: CheckpointRestore | None = None,
         artifact_handler: Callable[[ArtifactRegistration], Any] | None = None,
+        rank: int = 0,
+        world_size: int = 1,
+        local_rank: int = 0,
     ) -> Any:
         self._reserve()
         return self._run_reserved(
@@ -218,6 +284,9 @@ class LocalModelActor:
             checkpoint_interval_seconds=checkpoint_interval_seconds,
             checkpoint_restore=checkpoint_restore,
             artifact_handler=artifact_handler,
+            rank=rank,
+            world_size=world_size,
+            local_rank=local_rank,
         )
 
     # ActorManager reserves while holding the physical-slot lock and then uses
@@ -238,6 +307,9 @@ class LocalModelActor:
         checkpoint_interval_seconds: float | None,
         checkpoint_restore: CheckpointRestore | None,
         artifact_handler: Callable[[ArtifactRegistration], Any] | None,
+        rank: int = 0,
+        world_size: int = 1,
+        local_rank: int = 0,
     ) -> Any:
         result: Any = None
         experiment_error: BaseException | None = None
@@ -260,6 +332,10 @@ class LocalModelActor:
                     model=loaded.model,
                     tokenizer=loaded.tokenizer,
                     device=loaded.device,
+                    devices=loaded.devices,
+                    rank=rank,
+                    world_size=world_size,
+                    local_rank=local_rank,
                     job_id=job_id,
                     attempt_id=attempt_id,
                     workspace=workspace,
@@ -280,20 +356,22 @@ class LocalModelActor:
             with self._state_lock:
                 self._active_context = context
 
-            try:
-                result = invoke_experiment(experiment, context, kwargs)
-            except BaseException as exc:
-                experiment_error = exc
-                if self._dirty_on_experiment_error:
-                    context.mark_dirty(
-                        f"experiment raised {type(exc).__name__}; cleanup cannot be verified"
-                    )
-            finally:
+            with ExitStack() as imports:
                 try:
-                    context.close()
-                except CleanupError as exc:
-                    cleanup_error = exc
-                    context.mark_dirty("one or more experiment cleanup callbacks failed")
+                    imports.enter_context(source_imports(context.workspace))
+                    result = invoke_experiment(experiment, context, kwargs)
+                except BaseException as exc:
+                    experiment_error = exc
+                    if self._dirty_on_experiment_error:
+                        context.mark_dirty(
+                            f"experiment raised {type(exc).__name__}; cleanup cannot be verified"
+                        )
+                finally:
+                    try:
+                        context.close()
+                    except CleanupError as exc:
+                        cleanup_error = exc
+                        context.mark_dirty("one or more experiment cleanup callbacks failed")
 
                 with self._state_lock:
                     self._active_context = None
@@ -403,7 +481,7 @@ class ActorManager:
                 return actor
             if actor.has_pending_work:
                 raise IncompatibleActorBusyError(
-                    f"GPU {key.gpu_uuid!r} is busy with model {actor.key.model.alias!r}"
+                    f"GPU {key.gpu_uuid!r} is busy with actor {actor.actor_id!r}"
                 )
             actor.evict()
         actor = LocalModelActor(key, loader)
@@ -516,7 +594,9 @@ class ActorManager:
         return frozenset(
             description.key.model
             for description in self.snapshot()
-            if description.state in (ActorState.IDLE, ActorState.BUSY) and not description.dirty
+            if description.key.model is not None
+            and description.state in (ActorState.IDLE, ActorState.BUSY)
+            and not description.dirty
         )
 
     def close(self, *, force: bool = False) -> None:

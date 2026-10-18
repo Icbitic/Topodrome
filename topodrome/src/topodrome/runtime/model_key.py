@@ -9,6 +9,8 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
+from topodrome.domain.model_address import validate_repo_id, validate_revision, validate_subfolder
+
 _ACTOR_COMPONENT = re.compile(r"[^a-zA-Z0-9_-]+")
 
 
@@ -39,17 +41,19 @@ class ModelKey:
     private path when it is time to load the model.
     """
 
-    alias: str
+    repo_id: str
     revision: str
     backend: str
     backend_version: str
     dtype: str = "auto"
     quantization: str | None = None
     adapter: str | None = None
+    subfolder: str | None = None
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "alias", _required_text("alias", self.alias))
-        object.__setattr__(self, "revision", _required_text("revision", self.revision))
+        object.__setattr__(self, "repo_id", validate_repo_id(self.repo_id))
+        object.__setattr__(self, "revision", validate_revision(self.revision))
+        object.__setattr__(self, "subfolder", validate_subfolder(self.subfolder))
         object.__setattr__(self, "backend", _required_text("backend", self.backend))
         object.__setattr__(
             self,
@@ -68,8 +72,9 @@ class ModelKey:
         """Return the complete logical identity in a JSON-safe form."""
 
         return {
-            "alias": self.alias,
+            "repo_id": self.repo_id,
             "revision": self.revision,
+            "subfolder": self.subfolder,
             "backend": self.backend,
             "backend_version": self.backend_version,
             "dtype": self.dtype,
@@ -82,13 +87,14 @@ class ModelKey:
         """Build a key from protocol/config data with strict field names."""
 
         return cls(
-            alias=value["alias"],
+            repo_id=value["repo_id"],
             revision=value["revision"],
             backend=value["backend"],
             backend_version=value["backend_version"],
             dtype=value.get("dtype", "auto"),
             quantization=value.get("quantization"),
             adapter=value.get("adapter"),
+            subfolder=value.get("subfolder"),
         )
 
     @property
@@ -100,8 +106,8 @@ class ModelKey:
 
     @property
     def short_name(self) -> str:
-        alias = _ACTOR_COMPONENT.sub("_", self.alias).strip("_-").lower() or "model"
-        return f"{alias[:40]}-{self.fingerprint[:16]}"
+        repo_id = _ACTOR_COMPONENT.sub("_", self.repo_id).strip("_-").lower() or "model"
+        return f"{repo_id[:40]}-{self.fingerprint[:16]}"
 
 
 @dataclass(frozen=True, slots=True, order=True)
@@ -115,7 +121,7 @@ class ActorKey:
 
     site_id: str
     gpu_uuid: str
-    model: ModelKey
+    model: ModelKey | None
     runtime_fingerprint: str = "legacy-runtime"
     replica_gpu_uuids: tuple[str, ...] = ()
 
@@ -151,7 +157,7 @@ class ActorKey:
         return {
             "site_id": self.site_id,
             "gpu_uuid": self.gpu_uuid,
-            "model": self.model.as_dict(),
+            "model": self.model.as_dict() if self.model is not None else None,
             "runtime_fingerprint": self.runtime_fingerprint,
             "replica_gpu_uuids": list(self.replica_gpu_uuids),
         }
@@ -161,7 +167,7 @@ class ActorKey:
         return cls(
             site_id=value["site_id"],
             gpu_uuid=value["gpu_uuid"],
-            model=ModelKey.from_mapping(value["model"]),
+            model=ModelKey.from_mapping(value["model"]) if value["model"] is not None else None,
             runtime_fingerprint=value.get("runtime_fingerprint", "legacy-runtime"),
             replica_gpu_uuids=tuple(value.get("replica_gpu_uuids") or (value["gpu_uuid"],)),
         )

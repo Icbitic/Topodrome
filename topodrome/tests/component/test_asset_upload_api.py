@@ -70,7 +70,8 @@ async def test_upload_authorized_without_jobs_and_pin_consumer(
         source.mkdir()
         (source / "run.py").write_text("def run(context): return {}\n")
         consumer = await alice.submit(
-            source_dir=source, entrypoint="run.py", model="model-a", assets={"input": asset.ref}
+            source_dir=source, entrypoint="run.py", model="test/model-a",
+            assets={"input": asset.ref},
         )
         pin = consumer.spec.assets["input"]
         assert pin.pinned

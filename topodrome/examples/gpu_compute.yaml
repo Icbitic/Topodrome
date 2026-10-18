@@ -1,0 +1,7 @@
+name: model-free-single-gpu
+entrypoint: gpu_compute.py
+source_dir: .
+model: null
+resources: {gpu: 1, min_vram_gb: 2, cpu: 2, memory_gb: 4}
+required_outputs: [gpu-result.json]
+retry: {max_attempts: 2}

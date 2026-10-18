@@ -16,7 +16,11 @@ from .input_staging import aware
 
 
 def model_context(spec):
-    return _digest(spec.model.model_dump(mode="json"))
+    return _digest(
+        spec.model.model_dump(mode="json")
+        if spec.model is not None
+        else {"model": None, "execution": spec.execution_mode, "gpus": spec.resources.gpu_count}
+    )
 
 
 def workload_context(spec):
@@ -26,7 +30,16 @@ def workload_context(spec):
             k: v
             for k, v in spec.model_dump(mode="json").items()
             if k
-            in {"entrypoint", "source_ref", "model", "assets", "resources", "kwargs", "runtime"}
+            in {
+                "entrypoint",
+                "source_ref",
+                "model",
+                "execution",
+                "assets",
+                "resources",
+                "kwargs",
+                "runtime",
+            }
         }
     )
 

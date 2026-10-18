@@ -16,6 +16,7 @@ import topodrome.deployment.ssh_tunnel as ssh_tunnel
 from topodrome.deployment.ssh_tunnel import (
     SSHLocalForwardConfig,
     SSHLocalForwardError,
+    SSHLocalForwardGroup,
     SSHLocalForwardSupervisor,
     TunnelOwnershipRecord,
     TunnelProcessIdentity,
@@ -23,6 +24,63 @@ from topodrome.deployment.ssh_tunnel import (
 )
 
 pytestmark = pytest.mark.unit
+
+
+def test_forward_group_keeps_control_alive_when_bulk_reconnect_fails():
+    calls = []
+
+    class Tunnel:
+        def __init__(self, name):
+            self.name = name
+
+        def ensure_running(self):
+            calls.append((self.name, "ensure"))
+            if self.name == "bulk":
+                raise SSHLocalForwardError("synthetic disconnected bulk route")
+
+        def stop(self):
+            calls.append((self.name, "stop"))
+
+    group = SSHLocalForwardGroup([Tunnel("control"), Tunnel("bulk")])
+    with pytest.raises(SSHLocalForwardError):
+        group.ensure_running()
+    assert calls == [("control", "ensure"), ("bulk", "ensure")]
+    group.stop()
+    assert calls[-2:] == [("bulk", "stop"), ("control", "stop")]
+
+
+def test_forward_group_attempts_both_reconnects_even_if_control_fails():
+    calls = []
+
+    class Tunnel:
+        def __init__(self, name):
+            self.name = name
+
+        def ensure_running(self):
+            calls.append(self.name)
+            if self.name == "control":
+                raise SSHLocalForwardError("synthetic disconnected control route")
+
+    with pytest.raises(SSHLocalForwardError):
+        SSHLocalForwardGroup([Tunnel("control"), Tunnel("bulk")]).ensure_running()
+    assert calls == ["control", "bulk"]
+
+
+def test_forward_group_stops_control_even_when_bulk_stop_fails():
+    calls = []
+
+    class Tunnel:
+        def __init__(self, name):
+            self.name = name
+
+        def stop(self):
+            calls.append(self.name)
+            if self.name == "bulk":
+                raise SSHLocalForwardError("synthetic bulk teardown failure")
+
+    with pytest.raises(SSHLocalForwardError):
+        SSHLocalForwardGroup([Tunnel("control"), Tunnel("bulk")]).stop()
+    assert calls == ["bulk", "control"]
 
 
 def _protected_file(parent: Path, name: str, content: str) -> Path:
@@ -60,6 +118,7 @@ if {listen!r}:
     forward = sys.argv[sys.argv.index('-L') + 1]
     host, raw_port, _target_host, _target_port = forward.split(':')
     listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     listener.bind((host, int(raw_port)))
     listener.listen()
 while running:
@@ -161,8 +220,70 @@ def test_starts_adopts_and_stops_only_exact_owned_process(tmp_path: Path) -> Non
         os.kill(started.pid, 0)
 
 
-def test_refuses_unowned_occupied_local_port_without_spawning(tmp_path: Path) -> None:
+def _wait_for_zombie(pid: int) -> None:
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline:
+        if ssh_tunnel._process_stat(pid)[1] == "Z":
+            return
+        time.sleep(0.01)
+    raise AssertionError("owned test child did not exit")
+
+
+def test_dead_bulk_child_reconnects_without_restarting_control(tmp_path):
+    control = SSHLocalForwardSupervisor(_config(tmp_path / "control"))
+    bulk = SSHLocalForwardSupervisor(_config(tmp_path / "bulk"))
+    group = SSHLocalForwardGroup([control, bulk])
+    group.ensure_running()
+    control_pid = json.loads(control.state_path.read_text())["identity"]["pid"]
+    bulk_pid = json.loads(bulk.state_path.read_text())["identity"]["pid"]
+    try:
+        os.kill(bulk_pid, signal.SIGKILL)  # exact test-owned generation; do not reap in the test
+        _wait_for_zombie(bulk_pid)
+        group.ensure_running()
+        assert json.loads(control.state_path.read_text())["identity"]["pid"] == control_pid
+        assert json.loads(bulk.state_path.read_text())["identity"]["pid"] != bulk_pid
+        assert not Path(f"/proc/{bulk_pid}").exists()
+    finally:
+        group.stop()
+
+
+def test_adopted_dead_leader_can_recover_without_signalling_its_zombie(tmp_path, monkeypatch):
+    config = _config(tmp_path)
+    original = SSHLocalForwardSupervisor(config)
+    started = original.ensure_running()
+    child = original._process
+    replacement = SSHLocalForwardSupervisor(config)
+    try:
+        os.kill(started.pid, signal.SIGKILL)
+        _wait_for_zombie(started.pid)
+        signals = []
+        actual = os.killpg
+
+        def record(group, signum):
+            if signum:
+                signals.append((group, signum))
+            return actual(group, signum)
+
+        monkeypatch.setattr(os, "killpg", record)
+        restarted = replacement.ensure_running()
+        assert restarted.pid != started.pid
+        assert signals == []
+        # Only the original parent can reap the old child. Recovery itself
+        # did not signal it or a foreign process and the new port is usable.
+        assert Path(f"/proc/{started.pid}").exists()
+        child.wait(timeout=2)
+    finally:
+        replacement.stop()
+        child.wait(timeout=2)
+
+
+@pytest.mark.parametrize("reuse_address", [False, True])
+def test_refuses_unowned_occupied_local_port_without_spawning(
+    tmp_path: Path, reuse_address: bool,
+) -> None:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as foreign:
+        if reuse_address:
+            foreign.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         foreign.bind(("127.0.0.1", 0))
         foreign.listen()
         port = int(foreign.getsockname()[1])
@@ -174,6 +295,26 @@ def test_refuses_unowned_occupied_local_port_without_spawning(tmp_path: Path) ->
 
         assert not supervisor.state_path.exists()
         assert foreign.fileno() >= 0
+
+
+def test_immediate_restart_accepts_only_time_wait_not_a_live_listener(tmp_path: Path) -> None:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as old_listener:
+        old_listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        old_listener.bind(("127.0.0.1", 0))
+        port = old_listener.getsockname()[1]
+        old_listener.listen()
+        with socket.create_connection(("127.0.0.1", port), timeout=2) as peer:
+            accepted, _ = old_listener.accept()
+            accepted.close()  # The forward's end closes first, leaving TIME_WAIT.
+            assert peer.recv(1) == b""
+
+    config = _config(tmp_path, port=port)
+    supervisor = SSHLocalForwardSupervisor(config)
+    started = supervisor.ensure_running()
+    try:
+        assert ssh_tunnel._process_owns_listener(started.pid, "127.0.0.1", port)
+    finally:
+        supervisor.stop()
 
 
 def test_changed_protected_configuration_never_replaces_live_tunnel(tmp_path: Path) -> None:

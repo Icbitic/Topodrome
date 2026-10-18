@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import importlib.metadata
+import logging
 import os
 import shutil
 import signal
@@ -19,7 +20,9 @@ from uuid import uuid4
 
 from topodrome.config import ModelCatalog, SiteSettings
 from topodrome.deployment.ssh_tunnel import (
+    LocalForwardLifecycle,
     SSHLocalForwardConfig,
+    SSHLocalForwardGroup,
     SSHLocalForwardSupervisor,
 )
 from topodrome.protocol.fencing import FencingAuthority
@@ -38,17 +41,18 @@ from topodrome.runtime.environment import configure_ray_driver_environment
 from topodrome.storage import (
     AssetResolver,
     LocalStorage,
-    RcloneCommandReader,
-    RcloneMirrorStorage,
-    RcloneMountStorage,
-    RcloneMountSupervisor,
 )
-from topodrome.storage.base import AuthoritativeDigestReader, StorageAdapter
+from topodrome.storage.base import StorageAdapter
+from topodrome.storage.bulk_connections import AdaptiveBulkConnections
+from topodrome.storage.http_mirror import HttpMirrorStorage
+from topodrome.storage.http_transport import SchedulerFileTransport
 from topodrome.storage.remote_digest import SchedulerDigestReader
+from topodrome.storage.small_files import SchedulerSmallFileClient
 
 from .admission import GIB, AdmissionController, LeaseFenceStore
 from .agent import SiteAgent
 from .cooperative import CooperativeExitPolicy, CooperativeExitVerifier
+from .idle_compute import IdleComputeManager
 from .inventory import (
     CooperativeProcessMatcher,
     GPUReservationLockReader,
@@ -73,8 +77,9 @@ class AgentApplication:
     inventory: NVMLInventoryProvider
     fences: LeaseFenceStore
     spool: EventSpool
-    storage_mount: RcloneMountSupervisor | None = None
-    control_tunnel: SSHLocalForwardSupervisor | None = None
+    control_tunnel: LocalForwardLifecycle | None = None
+    storage_close: Callable[[], None] | None = None
+    storage_maintenance: Callable[[], object] | None = None
 
     async def run(self) -> None:
         # This must precede every lazy Ray import. Topodrome, rather than Ray's
@@ -82,6 +87,39 @@ class AgentApplication:
         configure_ray_driver_environment()
         loop = asyncio.get_running_loop()
         shutdown_task: asyncio.Task[None] | None = None
+        tunnel_stop = asyncio.Event()
+        tunnel_task = None
+        renewal_task = None
+
+        async def maintain_tunnels():
+            while not tunnel_stop.is_set():
+                try:
+                    await asyncio.wait_for(tunnel_stop.wait(), timeout=5)
+                    return
+                except TimeoutError:
+                    pass
+                try:
+                    await asyncio.to_thread(self.control_tunnel.ensure_running)
+                except Exception as exc:
+                    # SSH ownership errors are safe to report by class only;
+                    # do not log endpoint commands, credentials or raw errors.
+                    logging.getLogger(__name__).warning(
+                        "storage tunnel unavailable: %s", type(exc).__name__
+                    )
+
+        async def maintain_bulk():
+            while not tunnel_stop.is_set():
+                try:
+                    await asyncio.wait_for(tunnel_stop.wait(), timeout=5)
+                    return
+                except TimeoutError:
+                    pass
+                try:
+                    await asyncio.to_thread(self.storage_maintenance)
+                except Exception as exc:
+                    logging.getLogger(__name__).warning(
+                        "bulk maintenance unavailable: %s", type(exc).__name__
+                    )
 
         def request_shutdown() -> None:
             nonlocal shutdown_task
@@ -99,6 +137,9 @@ class AgentApplication:
         try:
             if self.control_tunnel is not None:
                 await asyncio.to_thread(self.control_tunnel.ensure_running)
+                tunnel_task = asyncio.create_task(maintain_tunnels(), name="topodrome-tunnels")
+            if self.storage_maintenance is not None:
+                renewal_task = asyncio.create_task(maintain_bulk(), name="topodrome-bulk-renewal")
             await self.agent.run()
         except BaseException:
             # A background-loop failure otherwise leaves a Ray head and its
@@ -110,6 +151,11 @@ class AgentApplication:
                 )
             raise
         finally:
+            tunnel_stop.set()
+            if renewal_task is not None:
+                await renewal_task
+            if tunnel_task is not None:
+                await tunnel_task
             if shutdown_task is not None:
                 # Retrieve any failure deterministically. On a normal signal
                 # path agent.run cannot finish until shutdown set its stop
@@ -119,8 +165,8 @@ class AgentApplication:
             self.inventory.close()
             self.fences.close()
             self.spool.close()
-            if self.storage_mount is not None:
-                self.storage_mount.stop()
+            if self.storage_close is not None:
+                await asyncio.to_thread(self.storage_close)
             if self.control_tunnel is not None:
                 await asyncio.to_thread(self.control_tunnel.stop)
 
@@ -160,6 +206,7 @@ def _stage_model_to_local(
         verified = verify_transformers_payload(
             target,
             revision=registration.key.revision,
+            subfolder=registration.key.subfolder,
             verify_lfs_sha256=True,
         )
         return ModelRegistration(
@@ -175,6 +222,7 @@ def _stage_model_to_local(
     verify_transformers_payload(
         source,
         revision=registration.key.revision,
+        subfolder=registration.key.subfolder,
         verify_lfs_sha256=True,
     )
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -184,6 +232,7 @@ def _stage_model_to_local(
         verified = verify_transformers_payload(
             temporary,
             revision=registration.key.revision,
+            subfolder=registration.key.subfolder,
             verify_lfs_sha256=True,
         )
         try:
@@ -194,6 +243,7 @@ def _stage_model_to_local(
             verified = verify_transformers_payload(
                 target,
                 revision=registration.key.revision,
+                subfolder=registration.key.subfolder,
                 verify_lfs_sha256=True,
             )
     finally:
@@ -254,7 +304,21 @@ def _build_application(
     if not snapshots:
         raise RuntimeError("the site exposes no allowed physical GPUs")
 
-    storage, storage_mount = _storage(settings)
+    bulk_connections = _bulk_connections(settings)
+    if bulk_connections is not None:
+        rollback.append(bulk_connections.close)
+    control_tunnel = _control_tunnel(settings, bulk_override=bulk_connections)
+    if control_tunnel is not None:
+        rollback.append(control_tunnel.stop)
+        control_tunnel.ensure_running()
+    storage = (
+        _storage(settings)
+        if bulk_connections is None
+        else _storage(settings, bulk_connections=bulk_connections)
+    )
+    storage_close = getattr(storage, "close", None)
+    if storage_close is not None:
+        rollback.append(storage_close)
     from topodrome.storage.blobs import validate_layout
 
     storage.content_addressed = settings.storage_layout == "blobs-v1"
@@ -266,16 +330,23 @@ def _build_application(
             health_reader=storage,
         )
         storage.claim_blob = blob_client.claim_blob
-    if storage_mount is not None:
-        storage_mount.start()
-        rollback.append(storage_mount.stop)
-    validate_layout(settings.global_root / "storage-layout.json", settings.storage_layout)
+        rollback.append(blob_client.close)
+        mirror_close = storage_close
+
+        def close_storage() -> None:
+            try:
+                if mirror_close is not None:
+                    mirror_close()
+            finally:
+                blob_client.close()
+
+        storage_close = close_storage
+    validate_layout(storage.resolve("storage-layout.json"), settings.storage_layout)
     if not storage.healthcheck():
         raise RuntimeError("the configured global storage is unavailable")
     workspaces = WorkspaceManager(storage=storage, scratch_root=settings.scratch_root)
     registry, acquirer = _model_registry(settings)
     host_inventory = SystemHostInventory()
-    control_tunnel = _control_tunnel(settings)
 
     ray_config = _ray_cluster_config(
         tuple(snapshot.uuid for snapshot in snapshots),
@@ -310,6 +381,10 @@ def _build_application(
         regional_state=regional_state,
         finalization_concurrency=settings.finalization_concurrency,
         checkpoint_keep_snapshots=settings.checkpoint_keep_snapshots,
+        checkpoint_prefetch_max_bytes=settings.checkpoint_prefetch_max_bytes,
+        checkpoint_prefetch_concurrency=settings.checkpoint_prefetch_concurrency,
+        checkpoint_prefetch_memory_floor_bytes=settings.checkpoint_prefetch_memory_floor_bytes,
+        memory_available=lambda: host_inventory.sample().available_memory_bytes,
         finalization_journal=FinalizationJournal(settings.spool_path.parent / "finalization"),
     )
 
@@ -333,6 +408,12 @@ def _build_application(
     fence_path = settings.spool_path.with_name(f"{settings.spool_path.stem}.leases.sqlite3")
     fences = LeaseFenceStore(fence_path)
     rollback.append(fences.close)
+    idle_compute = (
+        IdleComputeManager(settings.idle_compute, fences, ownership, cooperative)
+        if settings.idle_compute.enabled else None
+    )
+    if idle_compute is not None:
+        outbound.heartbeat_ack = idle_compute.acknowledge
     admission = AdmissionController(
         inventory,
         fences,
@@ -393,6 +474,7 @@ def _build_application(
         process_ownership=ownership,
         cooperative_exit=exit_verifier,
         sentinel_factory=SubprocessCudaSentinelFactory(),
+        idle_compute=idle_compute,
         model_capabilities=backend.model_capabilities,
         cached_assets=backend.cached_assets,
         storage_available=storage.healthcheck,
@@ -404,31 +486,45 @@ def _build_application(
         inventory,
         fences,
         spool,
-        storage_mount,
         control_tunnel,
+        storage_close,
+        None if bulk_connections is None else bulk_connections.maintain,
     )
 
 
-def _control_tunnel(settings: SiteSettings) -> SSHLocalForwardSupervisor | None:
-    configured = settings.ssh_local_forward
-    if configured is None:
+def _control_tunnel(
+    settings: SiteSettings,
+    *,
+    bulk_override: AdaptiveBulkConnections | None = None,
+) -> LocalForwardLifecycle | None:
+    tunnels = [
+        bulk_override
+        if configured is settings.bulk_ssh_local_forward and bulk_override is not None
+        else SSHLocalForwardSupervisor(SSHLocalForwardConfig(**configured.model_dump()))
+        for configured in (settings.ssh_local_forward, settings.bulk_ssh_local_forward)
+        if configured is not None
+    ]
+    if not tunnels:
         return None
-    return SSHLocalForwardSupervisor(
-        SSHLocalForwardConfig(
-            identity_file=configured.identity_file,
-            known_hosts_file=configured.known_hosts_file,
-            remote_host=configured.remote_host,
-            remote_user=configured.remote_user,
-            remote_port=configured.remote_port,
-            local_host=configured.local_host,
-            local_port=configured.local_port,
-            target_host=configured.target_host,
-            target_port=configured.target_port,
-            state_directory=configured.state_directory,
-            ssh_executable=configured.ssh_executable,
-            startup_timeout_seconds=configured.startup_timeout_seconds,
-            shutdown_timeout_seconds=configured.shutdown_timeout_seconds,
-        )
+    return tunnels[0] if len(tunnels) == 1 else SSHLocalForwardGroup(tunnels)
+
+
+def _bulk_connections(settings: SiteSettings) -> AdaptiveBulkConnections | None:
+    configured = settings.storage
+    if configured is None or not configured.bulk_reconnect.enabled:
+        return None
+    if settings.enrollment_token is None:
+        raise ValueError("adaptive bulk routes require site enrollment")
+    bulk_config = settings.bulk_ssh_local_forward
+    if bulk_config is None or configured.bulk_url is None:
+        raise ValueError("adaptive bulk routes require a configured bulk SSH forward")
+    return AdaptiveBulkConnections(
+        SSHLocalForwardConfig(**bulk_config.model_dump()),
+        configured.bulk_url,
+        settings.site_id,
+        settings.enrollment_token.get_secret_value(),
+        configured.bulk_reconnect,
+        timeout=configured.request_timeout_seconds,
     )
 
 
@@ -463,59 +559,55 @@ def _ray_cluster_config(
 
 def _storage(
     settings: SiteSettings,
-) -> tuple[StorageAdapter, RcloneMountSupervisor | None]:
-    if settings.rclone is None:
-        return LocalStorage(settings.global_root, create=False), None
-    reader: AuthoritativeDigestReader = RcloneCommandReader(
-        settings.rclone.remote,
-        binary=settings.rclone.binary,
-        command_timeout_seconds=settings.rclone.verification_timeout_seconds,
-        transfer_timeout_seconds=settings.rclone.transfer_timeout_seconds,
-    )
-    if settings.rclone.verification_via_scheduler:
-        if settings.enrollment_token is None:
-            raise ValueError("scheduler storage verification requires site enrollment")
-        reader = SchedulerDigestReader(
+    *,
+    bulk_connections: AdaptiveBulkConnections | None = None,
+) -> StorageAdapter:
+    configured = settings.storage
+    if configured is None:
+        return LocalStorage(settings.global_root, create=False)
+    if settings.enrollment_token is None:
+        raise ValueError("HTTP storage requires site enrollment")
+    token = settings.enrollment_token.get_secret_value()
+    small_files = (
+        SchedulerSmallFileClient(
             settings.scheduler_url,
             settings.site_id,
-            settings.enrollment_token.get_secret_value(),
-            health_reader=reader,
-            timeout=settings.rclone.verification_timeout_seconds,
+            token,
+            max_bytes=configured.small_file_max_bytes,
         )
-    if settings.rclone.mode == "mirror":
-        return (
-            RcloneMirrorStorage(
-                settings.global_root,
-                settings.rclone.remote,
-                binary=settings.rclone.binary,
-                command_timeout_seconds=settings.rclone.verification_timeout_seconds,
-                transfer_timeout_seconds=settings.rclone.transfer_timeout_seconds,
-                verification_timeout_seconds=settings.rclone.verification_timeout_seconds,
-                poll_interval_seconds=min(settings.rclone.poll_interval_seconds, 1.0),
-                min_free_space_gb=settings.rclone.min_free_space_gb,
-                healthcheck_cache_seconds=settings.rclone.poll_interval_seconds,
-                authoritative_reader=reader,
-            ),
-            None,
+        if configured.small_file_max_bytes
+        else None
+    )
+    bulk = None
+    try:
+        bulk = SchedulerFileTransport(
+            settings.scheduler_url,
+            settings.site_id,
+            token,
+            bulk_url=configured.bulk_url,
+            timeout=configured.request_timeout_seconds,
+            min_free_space_gb=configured.min_free_space_gb,
+            small_files=small_files,
+            bulk_connections=bulk_connections,
         )
-    storage = RcloneMountStorage(
-        settings.rclone.mountpoint,
-        reader,
-        verification_timeout_seconds=settings.rclone.verification_timeout_seconds,
-    )
-    supervisor = RcloneMountSupervisor(
-        remote=settings.rclone.remote,
-        mountpoint=settings.rclone.mountpoint,
-        cache_dir=settings.rclone.cache_dir,
-        health_reader=storage,
-        binary=settings.rclone.binary,
-        vfs_cache_max_size_gb=settings.rclone.vfs_cache_max_size_gb,
-        min_free_space_gb=settings.rclone.min_free_space_gb,
-        write_back_seconds=settings.rclone.write_back_seconds,
-        poll_interval_seconds=settings.rclone.poll_interval_seconds,
-        startup_timeout_seconds=settings.rclone.startup_timeout_seconds,
-    )
-    return storage, supervisor
+        storage = HttpMirrorStorage(
+            settings.global_root,
+            configured.authority_id or settings.scheduler_url,
+            transfer_timeout_seconds=configured.transfer_timeout_seconds,
+            verification_timeout_seconds=configured.verification_timeout_seconds,
+            min_free_space_gb=configured.min_free_space_gb,
+            healthcheck_cache_seconds=configured.healthcheck_cache_seconds,
+            authoritative_reader=bulk,
+            small_file_client=small_files,
+            bulk_transport=bulk,
+        )
+    except BaseException:
+        if bulk is not None:
+            bulk.close()
+        if small_files is not None:
+            small_files.close()
+        raise
+    return storage
 
 
 def _model_registry(
@@ -527,13 +619,14 @@ def _model_registry(
     if settings.model_config_path is None:
         return registry, _AcquisitionRouter(acquirers, local_stage_targets)
     catalog = ModelCatalog.from_yaml(settings.model_config_path)
-    for definition in catalog.models.values():
+    for definition in catalog.variants():
         location = definition.sites.get(settings.model_catalog_site_id or settings.site_id)
         if location is None:
             continue
         key = ModelKey(
-            alias=definition.alias,
+            repo_id=definition.repo_id,
             revision=definition.revision,
+            subfolder=definition.subfolder,
             backend=definition.backend,
             backend_version=definition.backend_version,
             dtype=definition.dtype,
@@ -543,7 +636,7 @@ def _model_registry(
             installed = importlib.metadata.version("transformers")
             if definition.backend_version not in {"configured", installed}:
                 raise RuntimeError(
-                    f"model {definition.alias!r} requires transformers "
+                    f"model {definition.repo_id!r} requires transformers "
                     f"{definition.backend_version}, but this site has {installed}"
                 )
         configured_paths = (
@@ -564,6 +657,7 @@ def _model_registry(
                 payload = verify_transformers_payload(
                     candidate,
                     revision=definition.revision,
+                    subfolder=definition.subfolder,
                     verify_lfs_sha256=settings.verify_preseeded_model_hashes,
                     revision_manifest=location.revision_manifest,
                 )
@@ -583,11 +677,11 @@ def _model_registry(
                 )
                 if path is not None
             ),
-            settings.scratch_root / "models" / definition.alias,
+            settings.scratch_root / "models" / key.fingerprint,
         )
         if existing is None and location.origin is None:
             raise RuntimeError(
-                f"model {definition.alias!r} has no verified local payload and no origin"
+                f"model {definition.repo_id!r} has no verified local payload and no origin"
             )
         registration = ModelRegistration(
             key=key,

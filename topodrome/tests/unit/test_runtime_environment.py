@@ -18,7 +18,7 @@ from topodrome.runtime.environment import (
 )
 from topodrome.site_agent.ray_cluster import RayClusterConfig, SubprocessRayLifecycle
 
-pytestmark = pytest.mark.unit
+pytestmark = [pytest.mark.unit, pytest.mark.usefixtures("ray_alias_tmpfs")]
 
 
 def _credential_bearing_environment() -> dict[str, str]:

@@ -1,6 +1,6 @@
 source_dir: .
 entrypoint: live_log_smoke.py
-model: meta-llama-3-8b-instruct
+model: meta-llama/Meta-Llama-3-8B-Instruct
 resources:
   gpu: 1
   min_vram_gb: 15

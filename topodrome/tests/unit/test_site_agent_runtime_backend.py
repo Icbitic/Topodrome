@@ -68,7 +68,7 @@ def test_checkpoint_finalization_verifies_only_latest_snapshot(tmp_path: Path) -
     assignment = SimpleNamespace(
         job_id="job-1",
         attempt_id="attempt-1",
-        raw_spec={"entrypoint": "run.py", "model": {"alias": "model"}},
+        raw_spec={"entrypoint": "run.py", "model": {"repo_id": "test/model"}},
     )
     result = RuntimeExecutionBackend._verify_checkpoints(
         backend, assignment, SimpleNamespace(checkpoint_dir=checkpoints)
@@ -205,7 +205,7 @@ async def test_runtime_backend_forwards_runtime_resources_to_all_admitted_gpus(
     tmp_path: Path,
 ) -> None:
     model_key = ModelKey(
-        alias="model",
+        repo_id="test/model",
         revision="revision",
         backend="transformers",
         backend_version="1",
@@ -329,7 +329,7 @@ async def test_runtime_backend_prepares_one_warm_model_sharded_replica(
     tmp_path: Path,
 ) -> None:
     model_key = ModelKey(
-        alias="model",
+        repo_id="test/model",
         revision="revision",
         backend="transformers",
         backend_version="1",
@@ -454,7 +454,7 @@ async def test_stale_warm_runtime_is_not_advertised_or_removed_before_disposal(
     tmp_path: Path,
 ) -> None:
     model_key = ModelKey(
-        alias="model",
+        repo_id="test/model",
         revision="revision",
         backend="transformers",
         backend_version="1",
@@ -557,7 +557,7 @@ def run(context):
 
     asset_resolver = TrackingAssetResolver(storage, cache_root=tmp_path / "asset-cache")
     model_key = ModelKey(
-        alias="model",
+        repo_id="test/model",
         revision="revision",
         backend="transformers",
         backend_version="1",
@@ -848,7 +848,7 @@ def run(context, value):
     )
     asset_digest = asset_manifest_digest((asset_member,))
     model_key = ModelKey(
-        alias="model",
+        repo_id="test/model",
         revision="revision",
         backend="transformers",
         backend_version="1",

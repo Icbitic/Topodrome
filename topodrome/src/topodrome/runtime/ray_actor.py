@@ -103,9 +103,7 @@ def _bounded_call(
     try:
         succeeded, value = result.get(timeout=timeout_seconds)
     except queue.Empty:
-        raise RayActorTimeoutError(
-            f"{operation} exceeded {timeout_seconds:g} seconds"
-        ) from None
+        raise RayActorTimeoutError(f"{operation} exceeded {timeout_seconds:g} seconds") from None
     if not succeeded:
         raise value
     return value
@@ -117,9 +115,7 @@ def _ray_get(ray: Any, value: Any, *, timeout_seconds: float, operation: str) ->
     except Exception as exc:
         timeout_type = getattr(getattr(ray, "exceptions", None), "GetTimeoutError", None)
         if isinstance(timeout_type, type) and isinstance(exc, timeout_type):
-            raise RayActorTimeoutError(
-                f"{operation} exceeded {timeout_seconds:g} seconds"
-            ) from exc
+            raise RayActorTimeoutError(f"{operation} exceeded {timeout_seconds:g} seconds") from exc
         raise
 
 
@@ -266,9 +262,7 @@ class RayActorSpec:
             raise ValueError("num_cpus must be non-negative")
         if self.memory_bytes is not None and self.memory_bytes <= 0:
             raise ValueError("memory_bytes must be positive")
-        visible_devices = tuple(
-            value.strip() for value in self.cuda_visible_device.split(",")
-        )
+        visible_devices = tuple(value.strip() for value in self.cuda_visible_device.split(","))
         if any(not value for value in visible_devices):
             raise ValueError("CUDA device list contains an empty member")
         if len(set(visible_devices)) != len(visible_devices):
@@ -469,6 +463,9 @@ class _RayActorProcess:
     def request_preemption(self, reason: str) -> bool:
         return self._actor.request_preemption(reason)
 
+    def replace_model(self, key: ActorKey, loader: ModelLoader, expected: ActorKey) -> str:
+        return self._actor.replace_model(key, loader, expected=expected)
+
     def shutdown(self, force: bool = False) -> None:
         self._actor.evict(force=force)
 
@@ -661,7 +658,9 @@ class RayWorkerGroupHandle:
         references: list[Any] = []
         try:
             for rank, worker in enumerate(self._workers):
-                options = _rank_runtime_options(runtime_options, rank=rank)
+                options = _rank_runtime_options(
+                    runtime_options, rank=rank, world_size=len(self._workers)
+                )
                 references.append(worker.submit(experiment, **options))
             results = _ray_get(
                 self._ray,
@@ -740,8 +739,11 @@ class RayWorkerGroupHandle:
             return True
 
 
-def _rank_runtime_options(options: Mapping[str, Any], *, rank: int) -> dict[str, Any]:
+def _rank_runtime_options(
+    options: Mapping[str, Any], *, rank: int, world_size: int
+) -> dict[str, Any]:
     result = dict(options)
+    result.update(rank=rank, world_size=world_size, local_rank=0)
     if rank == 0:
         return result
     # Only rank zero owns durable attempt output. Other ranks still execute and
@@ -754,9 +756,7 @@ def _rank_runtime_options(options: Mapping[str, Any], *, rank: int) -> dict[str,
         log_path = rank_kwargs.get("log_path")
         if isinstance(log_path, str):
             path = Path(log_path)
-            rank_kwargs["log_path"] = str(
-                path.with_name(f"{path.stem}.rank-{rank}{path.suffix}")
-            )
+            rank_kwargs["log_path"] = str(path.with_name(f"{path.stem}.rank-{rank}{path.suffix}"))
         result["kwargs"] = rank_kwargs
     return result
 
@@ -805,6 +805,7 @@ class DetachedRayActorAdapter:
         loader: ModelLoader,
         *,
         dirty_on_experiment_error: bool,
+        detached: bool = True,
     ) -> Any:
         if bool(getattr(loader, "contains_credentials", False)):
             raise ValueError(
@@ -817,7 +818,7 @@ class DetachedRayActorAdapter:
             self.ray.remote,
             _RayActorProcess,
         )
-        options = _actor_options(spec, detached=True)
+        options = _actor_options(spec, detached=detached)
         try:
             configured = _bounded_call(
                 "Ray actor option preparation",
@@ -840,11 +841,18 @@ class DetachedRayActorAdapter:
                 # returned.  Without its exact handle, cleanup is unconfirmed.
                 raise RayDisposalError("Ray actor creation outcome is unconfirmed") from exc
         except ValueError:
+            if not detached:
+                raise
             # A concurrent site-agent operation may have won named creation.
             existing = self._find(spec)
             if existing is None:
                 raise
             return existing
+
+    def create_private(self, spec: RayActorSpec, loader: ModelLoader) -> RayActorHandle:
+        """Create an unnamed attempt-owned process, never a reusable warm shell."""
+        handle = self._create(spec, loader, dirty_on_experiment_error=True, detached=False)
+        return RayActorHandle(self.ray, handle, spec, reused=False, timeouts=self.timeouts)
 
     def get_or_create(
         self,
@@ -852,6 +860,7 @@ class DetachedRayActorAdapter:
         loader: ModelLoader,
         *,
         dirty_on_experiment_error: bool = True,
+        expected_switch_actor_id: str | None = None,
     ) -> RayActorHandle:
         handle = self._find(spec)
         if handle is not None:
@@ -863,6 +872,11 @@ class DetachedRayActorAdapter:
                 timeouts=self.timeouts,
             )
             description = current.describe()
+            if (
+                expected_switch_actor_id is not None
+                and description["actor_id"] != expected_switch_actor_id
+            ):
+                raise RayDisposalError("runtime replacement actor identity changed")
             existing_key = ActorKey.from_mapping(description["key"])
             state = ActorState(description["state"])
             dirty = bool(description.get("dirty"))
@@ -876,7 +890,70 @@ class DetachedRayActorAdapter:
                 raise IncompatibleActorBusyError(
                     f"GPU {spec.key.gpu_uuid!r} has an incompatible busy Ray actor"
                 )
+            if (
+                state is ActorState.IDLE
+                and not dirty
+                and expected_switch_actor_id is not None
+                and description.get("supports_model_switch")
+                and callable(getattr(loader, "replace", None))
+                and existing_key.site_id == spec.key.site_id
+                and existing_key.replica_gpu_uuids == spec.key.replica_gpu_uuids
+                and existing_key.runtime_fingerprint == spec.key.runtime_fingerprint
+                and existing_key.model is not None
+                and spec.key.model is not None
+                and existing_key.model.backend == spec.key.model.backend == "transformers"
+                and existing_key.model.backend_version == spec.key.model.backend_version
+                and not any(
+                    (
+                        existing_key.model.quantization,
+                        existing_key.model.adapter,
+                        spec.key.model.quantization,
+                        spec.key.model.adapter,
+                    )
+                )
+            ):
+                if bool(getattr(loader, "contains_credentials", False)):
+                    raise ValueError("credential-bearing loaders cannot be sent to Ray")
+                try:
+                    reference = _bounded_call(
+                        "Ray checkpoint replacement submission",
+                        self.timeouts.control_seconds,
+                        handle.replace_model.remote,
+                        spec.key,
+                        loader,
+                        existing_key,
+                    )
+                    _ray_get(
+                        self.ray,
+                        reference,
+                        timeout_seconds=self.timeouts.prepare_seconds,
+                        operation="Ray checkpoint replacement",
+                    )
+                    replaced = current.describe()
+                    if (
+                        ActorKey.from_mapping(replaced["key"]) != spec.key
+                        or replaced["actor_id"] != description["actor_id"]
+                        or replaced["state"] != "idle"
+                        or replaced.get("dirty")
+                    ):
+                        raise RayActorError("checkpoint replacement identity was not confirmed")
+                except BaseException as switch_error:
+                    try:
+                        current.evict(force=True)
+                    except BaseException as cleanup_error:
+                        raise RayDisposalError(
+                            "checkpoint replacement disposal unconfirmed"
+                        ) from cleanup_error
+                    raise switch_error
+                # This is not an exact-model warm hit: retain startup accounting.
+                current.reused = False
+                return current
+            if expected_switch_actor_id is not None:
+                raise RayDisposalError("runtime replacement worker is no longer compatible")
             current.evict(force=False)
+
+        if expected_switch_actor_id is not None:
+            raise RayDisposalError("runtime replacement worker disappeared")
 
         handle = self._create(
             spec,
@@ -949,9 +1026,7 @@ class DetachedRayActorAdapter:
         except RayActorTimeoutError as exc:
             # A late placement group has no handle through which this process
             # can prove removal, so the complete gang must remain fenced.
-            raise RayDisposalError(
-                "Ray placement-group creation outcome is unconfirmed"
-            ) from exc
+            raise RayDisposalError("Ray placement-group creation outcome is unconfirmed") from exc
         workers: list[RayActorHandle] = []
         try:
             ready = _bounded_call(
@@ -999,9 +1074,7 @@ class DetachedRayActorAdapter:
                     # A private worker may still materialize after the local
                     # timeout. Placement-group removal is attempted below, but
                     # that does not prove the late actor never started.
-                    raise RayDisposalError(
-                        "Ray worker creation outcome is unconfirmed"
-                    ) from exc
+                    raise RayDisposalError("Ray worker creation outcome is unconfirmed") from exc
                 workers.append(
                     RayActorHandle(
                         self.ray,

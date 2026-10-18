@@ -66,6 +66,7 @@ class ManualAutoDLController(AutoDLStatusMixin):
         )
         self.operations = SQLProviderOperationStore(database)
         self.tasks: dict[str, asyncio.Task] = {}
+        self.maintenance_excluded = lambda _site_id: False
         self.lock = asyncio.Lock()
 
     def enrollment_token(self, site_id):
@@ -92,6 +93,8 @@ class ManualAutoDLController(AutoDLStatusMixin):
         async with self.lock:
             record = await inspect(request)
             site_id = record["site_id"]
+            if self.maintenance_excluded(site_id):
+                raise ValueError("site installation is fenced for an upgrade")
             path = self.root / (site_id + ".json")
             if path.exists():
                 previous = private_read(path)
@@ -139,6 +142,8 @@ class ManualAutoDLController(AutoDLStatusMixin):
             }
 
     async def unregister(self, site_id, *, automatic=False):
+        if self.maintenance_excluded(site_id):
+            raise ValueError("site removal is fenced for an upgrade")
         completed, result = await self.connections.run_if_disconnected(
             site_id, lambda: self._unregister_disconnected(site_id, automatic=automatic)
         )
@@ -152,6 +157,8 @@ class ManualAutoDLController(AutoDLStatusMixin):
         Exact GPU reservations reuse the normal admission/preemption protocol.
         They survive scheduler restarts and are canceled when shutdown finishes.
         """
+        if self.maintenance_excluded(site_id):
+            raise ValueError("site is fenced for an upgrade; cancel or resolve that upgrade first")
         if not valid_manual_site(site_id):
             raise ValueError("expected a manual AutoDL site ID")
         repository = SchedulerRepository()
@@ -249,6 +256,8 @@ class ManualAutoDLController(AutoDLStatusMixin):
         if not valid_manual_site(site_id):
             raise ValueError("expected a manual AutoDL site ID")
         async with self.lock:
+            if self.maintenance_excluded(site_id):
+                raise ValueError("site removal is fenced for an upgrade")
             task = self.tasks.get(site_id)
             if task and not task.done():
                 raise ValueError("instance operation is still in progress")
@@ -365,6 +374,10 @@ class ManualAutoDLController(AutoDLStatusMixin):
             site_id = row.site_id
             if not site_id or not valid_manual_site(site_id):
                 continue
+            if self.maintenance_excluded(site_id) and row.state not in {
+                State.DRAINING, State.STOPPING,
+            }:
+                continue
             if site_id in self.tasks and not self.tasks[site_id].done():
                 continue
             if row.state is State.STARTING:
@@ -419,7 +432,8 @@ class ManualAutoDLController(AutoDLStatusMixin):
                     and now - since >= timedelta(seconds=self.settings.autodl.idle_timeout_seconds)
                 )
             ):
-                self.tasks[site_id] = asyncio.create_task(self._drain(site_id))
+                if not self.maintenance_excluded(site_id):
+                    self.tasks[site_id] = asyncio.create_task(self._drain(site_id))
         return AutoDLReconcileResult(len(rows), 0, 0)
 
     def _offline_cleanup_due(self, row, site, now):

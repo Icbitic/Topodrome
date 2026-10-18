@@ -5,9 +5,11 @@ import base64
 import hashlib
 import json
 import re
+import shlex
 import tarfile
 from io import BytesIO
 from pathlib import Path
+from types import SimpleNamespace
 
 import httpx
 import pytest
@@ -207,33 +209,19 @@ async def test_managed_ssh_client_streams_local_path_in_bounded_chunks(
     source = tmp_path / "runtime.tar.zst"
     source.write_bytes(payload)
 
-    class _RemoteHandle:
-        def __init__(self) -> None:
-            self.digest = hashlib.sha256()
-            self.chunk_sizes: list[int] = []
-
-        async def __aenter__(self) -> _RemoteHandle:
-            return self
-
-        async def __aexit__(self, *_args: object) -> None:
-            return None
-
-        async def write(self, chunk: bytes) -> None:
-            self.chunk_sizes.append(len(chunk))
-            self.digest.update(chunk)
-
-    class _SFTP:
-        def __init__(self) -> None:
-            self.handle = _RemoteHandle()
-            self.opened: tuple[str, str] | None = None
-            self.chmod_call: tuple[str, int] | None = None
-
-        def open(self, path: str, mode: str) -> _RemoteHandle:
-            self.opened = (path, mode)
-            return self.handle
-
-        async def chmod(self, path: str, mode: int) -> None:
-            self.chmod_call = (path, mode)
+    class Connection:
+        async def run(self, command, *, stdin, **kwargs):
+            parts = shlex.split(command)
+            chunks = []
+            digest = hashlib.sha256()
+            while chunk := await stdin.read(kwargs["bufsize"]):
+                chunks.append(len(chunk))
+                digest.update(chunk)
+            self.chunks = chunks
+            self.digest = digest.hexdigest()
+            self.root, self.name, size, expected, self.mode = parts[-5:]
+            assert self.digest == expected
+            return SimpleNamespace(stdout=f"TOPODROME_SSH_FILE_OK {size} {expected}\n".encode())
 
     client = ManagedSSHClient(
         "worker.invalid",
@@ -241,17 +229,18 @@ async def test_managed_ssh_client_streams_local_path_in_bounded_chunks(
         "test-password",
         run_id="012345abcdef",
     )
-    sftp = _SFTP()
-    client._sftp = sftp
+    connection = Connection()
+    client._connection = connection
 
     remote = await client.put_path(source, "runtime.tar.zst", mode=0o640)
 
     assert remote == f"{client.remote_root}/runtime.tar.zst"
-    assert sftp.opened == (remote, "wb")
-    assert sftp.chmod_call == (remote, 0o640)
-    assert sftp.handle.digest.digest() == hashlib.sha256(payload).digest()
-    assert len(sftp.handle.chunk_sizes) > 1
-    assert max(sftp.handle.chunk_sizes) <= 1024 * 1024
+    assert connection.root == client.remote_root
+    assert connection.name == "runtime.tar.zst"
+    assert connection.mode == "640"
+    assert connection.digest == hashlib.sha256(payload).hexdigest()
+    assert len(connection.chunks) > 1
+    assert max(connection.chunks) <= 256 * 1024
 
 
 async def test_managed_ssh_client_put_path_rejects_invalid_inputs(tmp_path: Path) -> None:
@@ -261,7 +250,7 @@ async def test_managed_ssh_client_put_path_rejects_invalid_inputs(tmp_path: Path
         "test-password",
         run_id="012345abcdef",
     )
-    client._sftp = object()
+    client._connection = object()
     source = tmp_path / "runtime.tar.zst"
     source.write_bytes(b"seed")
 

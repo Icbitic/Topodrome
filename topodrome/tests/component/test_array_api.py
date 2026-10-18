@@ -32,7 +32,7 @@ async def test_array_api_sdk_owner_scope_pagination_and_controls(database, tmp_p
         request = {
             "job": {
                 "entrypoint": "experiment.py",
-                "model": "model",
+                "model": "test/model",
                 "source_ref": source,
                 "name": "Sweep",
                 "kwargs": {"seed": 7},

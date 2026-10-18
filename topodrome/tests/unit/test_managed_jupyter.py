@@ -65,7 +65,7 @@ class _KernelService:
             session_id=session_id,
             state=self.state,
             mode=KernelMode.SERVICE,
-            model=ModelRequirement(alias="model"),
+            model=ModelRequirement(repo_id="test/model"),
             created_at=datetime(2026, 9, 8, tzinfo=UTC),
         )
 
@@ -459,7 +459,7 @@ async def test_connected_managed_kernel_refresh_precedes_expiry_reaping(
     service = SchedulerService(database=database, settings=settings)
     now = utc_now()
     request = KernelRequest(
-        model=ModelRequirement(alias="model"),
+        model=ModelRequirement(repo_id="test/model"),
         idle_timeout_seconds=60,
     )
     async with database.transaction() as session:
@@ -555,7 +555,7 @@ async def test_kernel_stop_reaps_managed_server_when_agent_delivery_fails(
         managed_jupyter_controller=cast(Any, controller),
     )
     now = utc_now()
-    request = KernelRequest(model=ModelRequirement(alias="model"))
+    request = KernelRequest(model=ModelRequirement(repo_id="test/model"))
     async with database.transaction() as session:
         session.add(
             KernelSessionRow(
@@ -619,7 +619,7 @@ async def test_kernel_stop_delivery_continues_when_managed_cleanup_fails(
         managed_jupyter_controller=cast(Any, _FailingStopController()),
     )
     now = utc_now()
-    request = KernelRequest(model=ModelRequirement(alias="model"))
+    request = KernelRequest(model=ModelRequirement(repo_id="test/model"))
     async with database.transaction() as session:
         session.add(
             KernelSessionRow(

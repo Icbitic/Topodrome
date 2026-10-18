@@ -8,6 +8,7 @@ from typing import Any
 
 import httpx
 
+from topodrome.domain.scheduling import SitePreferenceRequest
 from topodrome.domain.specs import (
     GPUReservationExtensionRequest,
     GPUReservationRequest,
@@ -19,6 +20,7 @@ from topodrome.domain.specs import (
     KernelRequest,
     KernelSummary,
 )
+from topodrome.domain.upgrades import UpgradeRequest
 from topodrome.scheduler.assets import (
     AssetPublishRequest,
     AssetSummary,
@@ -207,8 +209,11 @@ class Client:
         visibility: AssetVisibility | None = None,
         limit: int = 100,
         tags: tuple[str, ...] = (),
+        all_versions: bool = False,
     ) -> list[AssetSummary]:
         params: dict[str, str | int | list[str]] = {"limit": limit}
+        if all_versions:
+            params["all_versions"] = "true"
         if visibility is not None:
             params["visibility"] = visibility
         if tags:
@@ -250,6 +255,12 @@ class Client:
         )
         _raise(response)
         return AssetSummary.model_validate(response.json())
+
+    def download(self, reference: str, destination: str | Path) -> Path:
+        """Download a job:// or asset:// file/tree, resuming verified immutable content."""
+        from .download import download_sync
+
+        return download_sync(self._http, reference, destination, _raise)
 
     def download_asset(
         self,
@@ -429,8 +440,11 @@ class Client:
     def gpus(self) -> list[dict[str, Any]]:
         return self._list("/api/v1/gpus")
 
-    def models(self) -> list[dict[str, Any]]:
-        return self._list("/api/v1/models")
+    def models(self, *, repo_id: str | None = None) -> list[dict[str, Any]]:
+        """List site snapshots, including registered refs and the default marker."""
+        return self._list(
+            "/api/v1/models", params={"repo_id": repo_id} if repo_id is not None else None
+        )
 
     def reserve_gpu(
         self,
@@ -491,10 +505,55 @@ class Client:
         _raise(response)
         return dict(response.json())
 
+    def system_metrics(self) -> dict[str, Any]:
+        """Fetch cached central storage and service diagnostics (operator only)."""
+        response = self._http.get("/api/v1/system")
+        _raise(response)
+        return dict(response.json())
+
     def reload_policy(self) -> dict[str, Any]:
         """Validate and stage the configured scheduling policy."""
 
         response = self._http.post("/api/v1/policy/reload")
+        _raise(response)
+        return dict(response.json())
+
+    def set_site_preference(self, request: SitePreferenceRequest) -> dict[str, Any]:
+        response = self._http.put(
+            "/api/v1/policy/site-preference", json=request.model_dump(mode="json")
+        )
+        _raise(response)
+        return dict(response.json())
+
+    def upgrades(self) -> list[dict[str, Any]]:
+        response = self._http.get("/api/v1/upgrades")
+        _raise(response)
+        return list(response.json())
+
+    def queue_upgrade(self, request: UpgradeRequest) -> dict[str, Any]:
+        response = self._http.post("/api/v1/upgrades", json=request.model_dump(mode="json"),
+                                  timeout=180)
+        _raise(response)
+        return dict(response.json())
+
+    def cancel_upgrade(self, upgrade_id: str) -> dict[str, Any]:
+        response = self._http.post(f"/api/v1/upgrades/{upgrade_id}/cancel")
+        _raise(response)
+        return dict(response.json())
+
+    def change_upgrade_pause(
+        self, upgrade_id: str, *, pause: str, expected_pause: str
+    ) -> dict[str, Any]:
+        response = self._http.post(f"/api/v1/upgrades/{upgrade_id}/pause", json={
+            "pause": pause, "expected_pause": expected_pause,
+        })
+        _raise(response)
+        return dict(response.json())
+
+    def recover_upgrade(self, upgrade_id: str, *, action: str) -> dict[str, Any]:
+        response = self._http.post(
+            f"/api/v1/upgrades/{upgrade_id}/recover", json={"action": action}
+        )
         _raise(response)
         return dict(response.json())
 
@@ -552,8 +611,10 @@ class Client:
     def autodl_operations(self) -> list[dict[str, Any]]:
         return self._list("/api/v1/providers/autodl/operations")
 
-    def _list(self, path: str) -> list[dict[str, Any]]:
-        response = self._http.get(path)
+    def _list(
+        self, path: str, *, params: dict[str, str] | None = None
+    ) -> list[dict[str, Any]]:
+        response = self._http.get(path, params=params)
         _raise(response)
         return list(response.json())
 

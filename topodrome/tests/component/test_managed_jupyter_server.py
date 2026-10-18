@@ -42,7 +42,7 @@ class _KernelService:
             session_id=session_id,
             state=KernelState.RUNNING,
             mode=KernelMode.SERVICE,
-            model=ModelRequirement(alias="synthetic-model"),
+            model=ModelRequirement(repo_id="test/synthetic-model"),
             site_id="synthetic-site",
             created_at=_NOW,
         )
@@ -547,7 +547,7 @@ async def test_managed_servers_use_owner_roots_and_reap_revoked_children_only(
             owner_username=owner,
             state=KernelState.RUNNING,
             mode=KernelMode.SERVICE,
-            model=ModelRequirement(alias="synthetic-model"),
+            model=ModelRequirement(repo_id="test/synthetic-model"),
             site_id="synthetic-site",
             created_at=_NOW,
         )

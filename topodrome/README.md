@@ -1,5 +1,8 @@
 # Topodrome
 
+Models use registered HF-style `repo_id` / `revision` / `subfolder` addresses;
+old model aliases are not accepted. See [model addressing](docs/MODEL_ADDRESSES.md).
+
 Topodrome presents one queue for batch experiments and interactive Jupyter
 sessions across Lab1, outbound-only Jupyter sites, and replaceable AutoDL GPU
 instances. Each physical site keeps its own Ray cluster and model cache; the
@@ -62,6 +65,13 @@ receive starvation protection without preempting running work. Dependencies are
 intentionally deferred; agents can submit follow-ups after completion notifications.
 
 ## Services
+
+`topodrome top` → **7 System** shows active central storage usage, estimated
+cleanup eligibility within 24 hours, filesystem free space and scheduler health.
+Storage samples are cached for five minutes and the view never triggers cleanup.
+Estimates respect retention references; remote caches/models and external
+archives are excluded. See the workbench section in `TUTORIAL.md` for scope and
+limitations. The diagnostics API (`GET /api/v1/system`) requires operator access.
 
 Copy the example configuration files and keep all credentials outside the
 repository. Start the scheduler and one agent with:
@@ -178,15 +188,15 @@ remains the fallback if paid startup is unavailable or fails. Expiry or
 cancellation makes the UUID schedulable again but does not synthesize a
 replacement actor.
 
-The institutional model catalog exposes the following exact, preseeded aliases
+The institutional model catalog exposes the following exact, preseeded repositories
 on both Lab1 and the remote Jupyter site:
 
-- `meta-llama-3-8b-instruct` (15 GiB);
-- `gemma-3-12b-it` (24 GiB);
-- `olmo-2-1124-7b-instruct` (14 GiB); and
-- `qwen3-4b-instruct-2507` (8 GiB).
+- `meta-llama/Meta-Llama-3-8B-Instruct` (15 GiB);
+- `google/gemma-3-12b-it` (24 GiB);
+- `allenai/OLMo-2-1124-7B-Instruct` (14 GiB); and
+- `Qwen/Qwen3-4B-Instruct-2507` (8 GiB).
 
-Every alias is pinned to an exact Hugging Face commit. Lab1 verifies the Hub
+Every default snapshot is pinned to an exact Hugging Face commit. Lab1 verifies the Hub
 metadata beside `/ssd/models`; the read-only Jupyter checkpoints under
 `/mnt/model/ckpts` are bound to owner-controlled external revision manifests.
 
@@ -201,78 +211,45 @@ cached. This avoids downloading an otherwise identical model merely to rebuild
 
 ### Remote global storage without FUSE
 
-Lab1's configured `global_root` is the only authoritative experiment
-filesystem. A remote Jupyter or AutoDL agent must not point `global_root` at an
-unrelated local directory. On hosts without `/dev/fuse`, configure
-`rclone.mode: mirror`: `global_root` and `rclone.mountpoint` then name a
-site-local cache, while `rclone.remote` names an SFTP endpoint rooted at the
-exact Lab1 authority. The ordinary `mount` mode remains available on hosts
-with FUSE.
-
-Use a separate storage-only SSH key for each site. Do not reuse a scheduler
-control-tunnel key or a personal login key. When using rclone's internal SFTP
-client, generate its dedicated private key in the PEM form supported by that
-client (the Beijing-B template names it `storage_rsa`). On Lab1, restrict the
-public key to a checksum-pinned rclone binary and the scheduler's exact global
-root, for example this `authorized_keys` prefix:
-
-```text
-restrict,command="/opt/topodrome/bin/rclone serve sftp --stdio /srv/topodrome" ssh-rsa <site-storage-public-key>
-```
-
-Replace both paths with the deployed binary and the same physical directory
-configured as the scheduler's `global_root`. The forced server provides only
-the scoped SFTP namespace: it grants neither a login shell nor forwarding.
-Keep the remote site's private key and pinned host key in an owner-only
-directory, and configure only a named, credential-free remote in an owner-only
-`rclone.conf`:
-
-```ini
-[lab1-global]
-type = sftp
-host = lab1.example
-user = topodrome
-port = 22
-key_file = /home/site/.config/topodrome/storage_rsa
-known_hosts_file = /home/site/.config/topodrome/lab1_known_hosts
-shell_type = none
-disable_hashcheck = true
-```
-
-Set the absolute path of that file as `RCLONE_CONFIG` in the protected site
-environment. The site YAML then uses a local namespace and the root-confined
-named remote:
+Lab1's configured `global_root` is the only storage authority. Remote agents
+configure a verified local HTTP mirror, never an unrelated native authority:
 
 ```yaml
 global_root: /fast/local/topodrome-global
-rclone:
-  mode: mirror
-  mountpoint: /fast/local/topodrome-global
-  remote: 'lab1-global:'
-  cache_dir: /fast/local/topodrome-rclone-vfs-cache
-  binary: /opt/topodrome/bin/rclone
+storage:
+  small_file_max_bytes: 1048576
   min_free_space_gb: 10
-  poll_interval_seconds: 5
+  request_timeout_seconds: 30
   verification_timeout_seconds: 120
   transfer_timeout_seconds: 21600
 ```
 
-`cache_dir` is retained for configuration compatibility and is used only by
-`mode: mount`; mirror data lives directly below `global_root`. The mirror
-atomically downloads missing immutable source bundles, asset members,
-artifacts, and checkpoints. Large file transfers use resumable partials bound
-to the remote object's identity and a separate, configurable transfer timeout.
-Output close is not a durability boundary:
-`flush_and_verify` synchronizes the local file, uploads through a unique remote
-temporary name, promotes it, then independently reads and hashes the Lab1
-bytes. Only then may an attempt or portable checkpoint be reported durable.
-The agent reports storage unavailable and rejects new work when the authority
-or minimum-free-space floor is unavailable.
+All metadata, tiny files, paged directory listings, resumable bulk reads and
+prefix writes use the enrolled-agent HTTP API. No external transfer executable,
+filesystem mount, or new public storage service is required.
+Tiny files use persistent connections and one verified request; bulk streams
+have bounded memory and exact Range/If-Match identity checks. Checksummed
+upload extents adapt from 128 KiB up to 8 MiB; ACKs follow fsync. Restart
+validates the owned stored prefix before resuming. Independent Lab1 SHA-256
+verification and atomic publication still precede durable completion.
 
-Sources, global asset pins, attempt paths, and checkpoint references are
-immutable cache keys. Do not use the mirrored namespace as an ad hoc mutable
-cross-site coordination filesystem. Model weights and large temporary tensors
-remain outside it in each site's model cache and scratch storage.
+HTTPS is required for non-loopback origins. If the site reaches the authority
+through SSH, configure `ssh_local_forward` for control and a second
+`bulk_ssh_local_forward` plus `storage.bulk_url` for bulk, with separate ports
+and state directories. Both routes target the same authority and disable
+ControlMaster reuse. Use only a dedicated pinned forwarding identity restricted
+to the scheduler endpoint, never a personal login key.
+See the complete AutoDL example. The agent reconnects owned forwards while
+preserving a healthy control route if bulk fails.
+
+Unsupported site configuration fields fail explicitly. Preserve an existing
+opaque journal identity as `storage.authority_id` while upgrading an idle site
+with pending receipts; this is not an executable protocol fallback.
+No content or database migration is needed. Upgrade the scheduler first, then
+idle agents, including pending finalization/staging/outboxes in the idle check.
+Sources, asset pins and attempt paths remain immutable; model caches and large
+temporary tensors stay outside experiment storage.
+See [HTTP-only transport](docs/HTTP_TRANSPORT.md) for recovery and tests.
 
 ### Terminal-only Jupyter site recovery
 
@@ -425,6 +402,11 @@ Array summaries show counts and parallelism; individual member details retain
 their own Summary, Attempts and Logs tabs. **Esc** returns to the same list
 selection. Space on a child row collapses its parent group in either view.
 
+Assets use the same interaction: **Space** or the disclosure arrow on an asset
+shows older versions inline; **Enter** opens the selected version's details.
+Each asset expands independently. History loads metadata only, with explicit
+loading/error and result-limit notices. The `h` shortcut applies only to Jobs.
+
 An authenticated client discovers the active source-admission snapshot before
 packaging. The production policy permits 1,024 files, 500 characters per
 normalized path, 256 MiB per file, and 1 GiB decoded in total. The compile-time
@@ -469,6 +451,19 @@ Then use `asset://private/tuned-lens@v1`, or
 small immutable manifest only; it does not duplicate a multi-GiB payload.
 Reusing the same name and version for different content is rejected. Asset
 payloads are artifact outputs and are not subject to source-bundle size limits.
+
+Retrieve job outputs or assets directly, without a GPU job or temporary asset:
+
+```bash
+topodrome download 'job://JOB_ID/results/' ./results
+topodrome download 'asset://private/tuned-lens@v1' ./lens
+```
+
+Both SDKs provide `download(reference, destination)` (await for async).
+Copies are editable, size/SHA-256 verified, and never overwrite a destination.
+Retry the same URI/destination to resume a private partial transfer. Active
+downloads temporarily protect their members from GC; they do not make outputs
+permanent. See the [tutorial](TUTORIAL.md#download-job-outputs-or-assets-without-a-gpu-job).
 
 The operator can reserve one exact physical GPU for a bounded maintenance
 window by UUID or by that site's current index:
@@ -520,7 +515,7 @@ import topodrome
 job = topodrome.submit(
     source_dir="examples",
     entrypoint="model_summary.py",
-    model="meta-llama-3-8b-instruct",
+    model="meta-llama/Meta-Llama-3-8B-Instruct",
     resources={"gpu": 1, "min_vram_gb": 15},
     idempotency_key="model-summary-v1",
 )
@@ -554,6 +549,14 @@ disturb a running job.
 
 ### Explicit multi-GPU execution
 
+For a GPU job that does not need a preloaded model, use `model: null` and an
+explicit positive per-GPU `resources.min_vram_gb`. `context.model/tokenizer`
+are `None`; the full context API remains available. `context.device` and
+`context.devices` contain real assigned worker-local PyTorch devices.
+`execution: single` runs once with the entire GPU gang; `execution: distributed`
+runs one private rank per GPU. See [model-free jobs](docs/MODEL_FREE_JOBS.md)
+for runnable examples and rank/lifecycle rules.
+
 Topodrome still schedules one physical GPU as one slot. A job that needs
 several GPUs requests several slots as one atomic gang; it never partially
 starts. The model's `parallelism` selects what happens after that gang is
@@ -566,7 +569,7 @@ leased:
   invokes the user entrypoint once per request while Transformers spreads one
   model replica across the ordered visible GPU list.
 
-Multi-GPU intent is never inferred from `resources.gpu`: the resource count
+For preloaded models, multi-GPU intent is never inferred from `resources.gpu`: the resource count
 must exactly equal `parallelism.degree`. Sharded jobs also set a GPU-only
 `max_memory_gb_per_gpu`; Topodrome rejects a resulting device map that omits a
 selected GPU or offloads any module to CPU or disk. Warm reuse requires every
@@ -579,7 +582,7 @@ oversized-model exercise with a 10 GiB cap per GPU:
 
 ```bash
 uv run topodrome submit examples/model_summary_sharded.yaml
-uv run topodrome kernel --model meta-llama-3-8b-instruct \
+uv run topodrome kernel --model meta-llama/Meta-Llama-3-8B-Instruct \
   --gpus 2 --min-vram-gb 12 --max-memory-per-gpu 10
 uv run topodrome kernel-status <session-id>
 uv run topodrome kernel-stop <session-id>
@@ -729,13 +732,12 @@ exact checkout and deployment configuration before registering manual capacity:
 uv run topodrome-build-autodl-bootstrap \
   --site-config configs/site.autodl.example.yaml \
   --model-config configs/models.example.yaml \
-  --rclone-binary /path/to/linux-amd64/rclone \
   --output-dir /path/to/autodl-bootstrap-staging
 ```
 
 The builder obtains `uv` from `PATH` unless `--uv-binary` is supplied. It rejects
 embedded credentials, non-AutoDL runtime paths, a placeholder scheduler URL, a
-non-rclone global filesystem, model paths outside `/root/autodl-fs` and
+missing HTTP storage mirror, model paths outside `/root/autodl-fs` and
 `/root/autodl-tmp`, or a Hugging Face origin that does not use
 `https://hf-mirror.com`. It also scans every bundled text file, including
 `uv.lock`, for credential-shaped material. It emits a SHA-256-addressed release,
@@ -750,7 +752,6 @@ a Lab1 runtime seed into the release:
 uv run topodrome-build-autodl-bootstrap \
   --site-config configs/site.autodl.example.yaml \
   --model-config configs/models.example.yaml \
-  --rclone-binary /path/to/linux-amd64/rclone \
   --runtime-seed /path/to/runtime-site-packages.tar.gz \
   --runtime-seed-platform x86_64-manylinux_2_31 \
   --output-dir /path/to/autodl-bootstrap-staging
@@ -758,16 +759,16 @@ uv run topodrome-build-autodl-bootstrap \
 
 The seed format is a gzip-compressed tar containing exactly one relative
 `site-packages/` tree. The builder validates every member and prints the
-credential-free rclone destination. That destination is content addressed by
+credential-free logical seed destination. That destination is content addressed by
 the seed SHA-256, the current `uv.lock` SHA-256, Python major/minor, Linux
 architecture, and libc major/minor. `--runtime-seed-platform` names the worker's
 exact uv wheel target; Beijing-B currently uses `x86_64-manylinux_2_31`. Omit it
 only when the build host and worker have the same libc ABI. A manylinux seed
 also supports a newer glibc on the same architecture, with the same Python
 major/minor and frozen uv dependency verification; older glibc and different
-architectures remain rejected. Upload the seed once
-from Lab1 with `rclone copyto` to the printed destination; the seed itself is
-never included in the release or copied to Beijing-B regional storage.
+architectures remain rejected. Stage the verified archive once under Lab1's
+configured global root at the manifest's `runtime_seed.logical_path`; the seed
+is not included in the release. AutoDL keeps a verified regional cache for reuse.
 
 The builder stages only the seed's installed-distribution metadata and asks uv
 to check the selected agent/runtime extras against the frozen lock and target
@@ -780,7 +781,7 @@ compatible hash already authorized by `uv.lock`.
 
 On a cold worker the bootstrap first checks the content-addressed regional
 cache under `/root/autodl-fs/topodrome/runtime-seeds`. On a miss it downloads
-from the named Lab1 remote and persists the verified archive there for future
+from Lab1 over resumable HTTP and persists the verified archive there for future
 instances. It verifies size and SHA-256 before every extraction, creates the
 target venv with the bundled `uv`, safely expands only `site-packages/` into the
 venv's actual purelib directory, and runs `uv sync --frozen --offline`. uv
@@ -793,32 +794,16 @@ unavailable seed or missing locked distributions, never to an integrity
 mismatch. Without a configured seed, the existing frozen online `uv sync`
 behavior is retained.
 
-Provision these two files separately, owned by the bootstrap user and mode
-`0600`, with their parent directory mode `0700`:
+Provision `/root/autodl-fs/topodrome/secrets/site.env` separately, owner-only
+mode 0600 in a mode-0700 directory. It contains enrollment, fence verification,
+and Hugging Face credentials.
+The stdlib seed helper reads only enrollment in-process; uv never inherits it.
 
-- `/root/autodl-fs/topodrome/secrets/site.env`, containing
-  `TOPODROME_SITE_ENROLLMENT_TOKEN`,
-  `TOPODROME_SITE_FENCE_VERIFICATION_KEY`, `TOPODROME_HF_TOKEN`, and the absolute
-  `RCLONE_CONFIG` path;
-- `/root/autodl-fs/topodrome/secrets/rclone.conf`, containing the Lab1 SFTP
-  named remote used by `rclone.remote` in the site YAML, its dedicated
-  storage-key path, and its pinned known-hosts path. Configure `shell_type =
-  none` and `disable_hashcheck = true`; Topodrome performs its own independent
-  SHA-256 read-back at the durability barrier. Set
-  `TOPODROME_BOOTSTRAP_RCLONE_CONFIG` only if this protected bootstrap path must
-  differ, and keep `RCLONE_CONFIG` in `site.env` pointed at the agent's protected
-  rclone configuration.
-
-The checked-in
-`configs/rclone.autodl-beijing-b.example.conf` and
-`configs/site.autodl.env.example` are secret-free installation templates for
-those files. The site YAML also expects a distinct control-forward identity at
-`/root/autodl-fs/topodrome/secrets/control_ed25519` and a pinned Lab1 host-key
-file at `/root/autodl-fs/topodrome/secrets/lab1_known_hosts`. Authorize the
-control public key on Lab1 for local forwarding only, restricted to
-`127.0.0.1:8042`; do not reuse either the storage key or an operator login key.
-The scheduler listener itself remains bound to loopback, while the AutoDL agent
-connects to `http://127.0.0.1:18042` through its owned SSH process.
+The site YAML expects a dedicated forwarding identity at
+`/root/autodl-fs/topodrome/secrets/control_ed25519` and a pinned host-key file
+at `/root/autodl-fs/topodrome/secrets/lab1_known_hosts`. Allow local forwarding
+only to Lab1's `127.0.0.1:8042`. The agent owns separate control and bulk SSH
+processes on local ports 18042 and 18043; the scheduler remains loopback-bound.
 
 For an OpenSSH version supporting `restrict`, the Lab1 control-key entry should
 have the following capability shape (substitute the generated public key):
@@ -830,16 +815,16 @@ restrict,port-forwarding,permitopen="127.0.0.1:8042" ssh-ed25519 <site-control-p
 The generated startup command needs no legacy Python environment on regional
 storage. On every newly created instance it verifies and expands the release
 under `/root/autodl-tmp/topodrome`, uses the bundled `uv` to create or validate a
-locked ephemeral `.venv`, places uv/Hugging Face/rclone/Ray caches on ephemeral
+locked ephemeral `.venv`, places uv/Hugging Face/Ray caches on ephemeral
 disk, and runs the site agent in the foreground. The agent mirrors required
-global objects directly over rclone/SFTP without FUSE, establishes its
+global objects over HTTP without FUSE, establishes its
 authenticated outbound scheduler connection, and owns the site-local Ray
 lifecycle. A retained power cycle can reuse ephemeral files; a
 released/recreated instance rebuilds them. Only the small immutable bootstrap
-releases, protected configuration, storage identity, agent spool/state, and
+releases, protected configuration, forwarding identity, agent spool/state, and
 model cache remain under `/root/autodl-fs`; neither a venv, global mirror, nor
 package cache is persisted.
-Release verification, extraction, rclone seed transfer, and `uv` reconciliation
+Release verification, extraction, HTTP seed transfer, and `uv` reconciliation
 run in an allowlisted environment. `site.env` is sourced only after those steps,
 immediately before the foreground agent starts.
 

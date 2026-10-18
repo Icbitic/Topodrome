@@ -115,7 +115,10 @@ class RuntimeExecutionService:
         pip: tuple[str, ...] = (),
         env: Mapping[str, str] | None = None,
         working_dir: str | None = None,
+        expected_switch_actor_id: str | None = None,
     ) -> PreparedActor:
+        if key.model is None and not use_ray:
+            raise RuntimeExecutionError("model-free GPU jobs require an isolated Ray worker")
         if use_ray:
             if self.ray is None:
                 raise RuntimeExecutionError("Ray execution was requested without a Ray adapter")
@@ -131,7 +134,19 @@ class RuntimeExecutionService:
                 env=env or {},
                 working_dir=working_dir,
             )
-            handle = self.ray.get_or_create(spec, loader)
+            handle = (
+                self.ray.create_private(spec, loader)
+                if key.model is None
+                else self.ray.get_or_create(
+                    spec,
+                    loader,
+                    **(
+                        {"expected_switch_actor_id": expected_switch_actor_id}
+                        if expected_switch_actor_id is not None
+                        else {}
+                    ),
+                )
+            )
             description = cast(Mapping[str, Any], _describe_prepared_ray_handle(handle))
             return PreparedActor(
                 actor_id=str(description["actor_id"]),
@@ -216,6 +231,7 @@ class RuntimeExecutionService:
         pip: tuple[str, ...] = (),
         env: Mapping[str, str] | None = None,
         working_dir: str | None = None,
+        expected_switch_actor_id: str | None = None,
     ) -> PreparedActor:
         """Prepare one reusable actor owning an exact ordered GPU gang."""
 
@@ -245,7 +261,15 @@ class RuntimeExecutionService:
             env=env or {},
             working_dir=working_dir,
         )
-        handle = self.ray.get_or_create(spec, sharded_loader)
+        handle = self.ray.get_or_create(
+            spec,
+            sharded_loader,
+            **(
+                {"expected_switch_actor_id": expected_switch_actor_id}
+                if expected_switch_actor_id is not None
+                else {}
+            ),
+        )
         description = cast(Mapping[str, Any], _describe_prepared_ray_handle(handle))
         return PreparedActor(
             actor_id=str(description["actor_id"]),
@@ -383,13 +407,10 @@ class RuntimeExecutionService:
                 return False
             description = actor.describe().as_dict()
             state = ActorState(description["state"])
-            return (
-                not bool(description.get("dirty"))
-                and (
-                    state is ActorState.IDLE
-                    if require_idle
-                    else state in (ActorState.IDLE, ActorState.BUSY)
-                )
+            return not bool(description.get("dirty")) and (
+                state is ActorState.IDLE
+                if require_idle
+                else state in (ActorState.IDLE, ActorState.BUSY)
             )
         handle = prepared._handle
         assert isinstance(handle, (RayActorHandle, RayWorkerGroupHandle))
@@ -415,10 +436,25 @@ class RuntimeExecutionService:
             if require_idle
             else all(state in (ActorState.IDLE, ActorState.BUSY) for state in states)
         )
-        return allowed and all(not bool(value.get("dirty")) for value in values) and (
-            not require_idle
-            or all(not int(value.get("pending_runs", 0)) for value in values)
+        return (
+            allowed
+            and all(not bool(value.get("dirty")) for value in values)
+            and all(
+                ActorKey.from_mapping(value["key"]) == key
+                for value, key in zip(values, prepared.group_keys or (prepared.key,), strict=True)
+            )
+            and (not require_idle or all(not int(value.get("pending_runs", 0)) for value in values))
         )
+
+    def can_switch_model(self, prepared: PreparedActor) -> bool:
+        """Read-only capability check; physical admission is still mandatory."""
+        self._validate_prepared(prepared)
+        if prepared.transport not in (ExecutionTransport.RAY, ExecutionTransport.RAY_SHARDED):
+            return False
+        if not self.is_live(prepared, require_idle=True):
+            return False
+        description = prepared._handle.describe()
+        return bool(description.get("supports_model_switch"))
 
     def reconnect(
         self,

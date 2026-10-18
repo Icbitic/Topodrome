@@ -163,7 +163,7 @@ class AttemptArtifactStore:
 
     def stage_bytes(self, logical_path: str, content: bytes) -> Path:
         normalized = normalize_logical_path(logical_path)
-        target = self.storage.resolve(f"{self.staging_prefix}/{normalized}")
+        target = self.storage.resolve_writable(f"{self.staging_prefix}/{normalized}")
         self._atomic_local_write(target, content)
         return target
 
@@ -172,7 +172,7 @@ class AttemptArtifactStore:
         source_path = Path(source)
         if not source_path.is_file():
             raise FileNotFoundError(source_path)
-        target = self.storage.resolve(f"{self.staging_prefix}/{normalized}")
+        target = self.storage.resolve_writable(f"{self.staging_prefix}/{normalized}")
         target.parent.mkdir(parents=True, exist_ok=True)
         temporary = target.with_name(f".{target.name}.tmp-{uuid4().hex}")
         try:
@@ -289,7 +289,7 @@ class AttemptArtifactStore:
 
     def _publish_manifest(self, logical_path: str, content: bytes, sha256: str) -> None:
         check_transfer_cancelled()
-        target = self.storage.resolve(logical_path)
+        target = self.storage.resolve_writable(logical_path)
         self._atomic_local_write(target, content)
         self.storage.flush_and_verify(logical_path, expected_sha256=sha256)
 

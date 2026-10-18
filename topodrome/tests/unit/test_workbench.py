@@ -83,6 +83,9 @@ class FakeClient:
             raise RuntimeError("DO_NOT_DISPLAY_SECRET")
         return deepcopy(self.snapshot)
 
+    async def system_metrics(self):
+        return {"storage_state": "refreshing", "database_ready": True, "connected_agents": 2}
+
     async def array(self, array_id, **kwargs):
         if self.array_gate:
             await self.array_gate.wait()
@@ -163,7 +166,7 @@ class FakeClient:
         return {"status": "staged"}
 
     async def models(self):
-        return [{"alias": "llama", "gpu": 1}]
+        return [{"repo_id": "test/llama", "gpu": 1}]
 
     async def storage_gc(self, **kwargs):
         self.calls.append(("storage", kwargs))
@@ -307,6 +310,39 @@ async def test_finishing_empty_filter_and_clearing_it_keeps_list_navigation(size
         await pilot.press("escape", "down")
         assert app.focused.id == "table-jobs"
         assert app.selected()["job_id"] == "job_abcd2222"
+
+
+async def test_asset_history_expansion_uses_api_and_keeps_job_history_separate():
+    client = FakeClient()
+    original = client.assets
+    calls = []
+
+    async def versions(**kwargs):
+        calls.append(kwargs["all_versions"])
+        latest = await original(**kwargs)
+        return latest + (
+            [{**latest[0], "version": "v0", "ref": "asset://private/a@v0"}]
+            if kwargs["all_versions"]
+            else []
+        )
+
+    client.assets = versions
+    app = Workbench(client, interval=60)
+    async with app.run_test(size=(100, 30)) as pilot:
+        await pilot.pause()
+        await pilot.press("4")
+        await pilot.pause()
+        assert app.widget("#table-assets", DataTable).row_count == 1
+        await pilot.press("space")
+        await pilot.pause()
+        assert app.widget("#table-assets", DataTable).row_count == 2
+        assert not app.show_history
+        await pilot.press("space")
+        await pilot.pause()
+        assert app.widget("#table-assets", DataTable).row_count == 1
+        assert calls[-2:] == [False, True]
+        await pilot.press("h")
+        assert not app.expanded_assets
 
 
 async def test_delayed_asset_rows_return_focus_from_automatic_empty_fallback():
@@ -912,7 +948,7 @@ async def test_left_right_switch_main_tabs_from_tables_and_tab_strip(size):
     app = Workbench(FakeClient(), interval=60)
     async with app.run_test(size=size) as pilot:
         await pilot.pause()
-        views = ("jobs", "gpus", "sites", "assets", "reservations", "autodl")
+        views = ("jobs", "gpus", "sites", "assets", "reservations", "autodl", "system")
         for view in (*views[1:], "jobs"):
             await pilot.press("right")
             assert app.active_view == view
@@ -2009,7 +2045,7 @@ async def test_impact_matches_latest_attempt_exact_gpu_and_warns_for_gang():
             "name": "lens training",
             "state": "running",
             "site_id": "lab1",
-            "model": "llama",
+            "model": "test/llama",
         },
         {
             "job_id": "job_other",

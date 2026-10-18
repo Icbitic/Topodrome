@@ -94,7 +94,12 @@ def timing_page(page, timing):
 
 def detail_page(view, row, job=None):
     page = Page()
-    if view == "jobs" and row.get("is_array"):
+    if view == "system":
+        page.section(row["name"])
+        page.field("Value", row["value"])
+        page.section("About this metric")
+        page.item(row["note"])
+    elif view == "jobs" and row.get("is_array"):
         summary = row["array_summary"]
         page.section(summary.get("name") or "Job array")
         page.field("State", summary.get("state"))
@@ -103,8 +108,14 @@ def detail_page(view, row, job=None):
         page.section("Members")
         page.field("Finished", f"{summary['terminal']} / {summary['total']}")
         for state in (
-            "queued", "assigning", "running", "retry_wait", "canceling",
-            "succeeded", "failed", "canceled",
+            "queued",
+            "assigning",
+            "running",
+            "retry_wait",
+            "canceling",
+            "succeeded",
+            "failed",
+            "canceled",
         ):
             count = summary.get("counts", {}).get(state)
             if count is not None:
@@ -125,7 +136,15 @@ def detail_page(view, row, job=None):
         page.field("State", row.get("state"))
         page.field("Site", row.get("site_id") or "Not assigned")
         model = spec.get("model") or row.get("model")
-        page.field("Model", model.get("alias") if isinstance(model, dict) else model)
+        page.field(
+            "Model", model.get("repo_id") if isinstance(model, dict) else model or "None (GPU job)"
+        )
+        if isinstance(model, dict):
+            page.field("Revision", model.get("revision"))
+            if model.get("subfolder") is not None:
+                page.field("Subfolder", model["subfolder"])
+        if model is None:
+            page.field("Execution", spec.get("execution") or row.get("execution") or "single")
         page.field("GPUs", row.get("gpu_count") or spec.get("resources", {}).get("gpu"))
         page.field("Progress", _progress_text(row.get("progress"), width=160) or "Not reported")
         if spec.get("description"):
@@ -178,6 +197,11 @@ def detail_page(view, row, job=None):
         page.field("State", row.get("state"))
         page.field("Type", row.get("kind"))
         page.field("Region", row.get("region") or "Not specified")
+        if view == "sites":
+            page.section("Placement preference")
+            rank = row.get("preference_rank")
+            page.field("Order", f"#{rank}" if rank else "Automatic fallback")
+            page.item("Preference applies to eligible new work only; running jobs stay untouched.")
         if view == "autodl":
             page.field("Agent", row.get("site_state") or row.get("state"))
             if row.get("state") == "starting":
@@ -255,10 +279,12 @@ def attempts_page(attempts):
 def models_page(models):
     page = Page()
     for model in models:
-        page.section(model.get("alias", "Model"))
+        page.section(model.get("repo_id", "Model"))
         for label, key in (
             ("Site", "site_id"),
             ("Availability", "availability"),
+            ("Revision", "revision"),
+            ("Subfolder", "subfolder"),
             ("Backend", "backend"),
             ("Precision", "dtype"),
         ):

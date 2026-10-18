@@ -17,7 +17,7 @@ from topodrome.runtime.ray_actor import ray_gpu_resource_name
 
 def model_key(*, revision: str = "0123456789abcdef") -> ModelKey:
     return ModelKey(
-        alias="meta-llama-3-8b-instruct",
+        repo_id="meta-llama/Meta-Llama-3-8B-Instruct",
         revision=revision,
         backend="transformers",
         backend_version="4.48.0",
@@ -108,8 +108,9 @@ def test_registry_requires_exact_selection_when_alias_is_ambiguous() -> None:
     )
 
     with pytest.raises(AmbiguousModelError):
-        registry.resolve("meta-llama-3-8b-instruct")
-    assert registry.resolve("meta-llama-3-8b-instruct", revision="two").key.revision == "two"
+        registry.resolve("meta-llama/Meta-Llama-3-8B-Instruct")
+    selected = registry.resolve("meta-llama/Meta-Llama-3-8B-Instruct", revision="two")
+    assert selected.key.revision == "two"
 
 
 def test_ray_resource_name_matches_site_agent_convention() -> None:

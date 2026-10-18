@@ -44,6 +44,10 @@ class LeaseRequest:
     renewal_ttl_seconds: float = 90.0
     allow_actor_reuse: bool = True
     replace_idle_actors: bool = False
+    # Site-private proof, never accepted from the scheduler/user wire payload.
+    runtime_switch_actor_id: str | None = None
+    runtime_switch_model_key: str | None = None
+    runtime_switch_process_ids: tuple[int, ...] = ()
 
     def __post_init__(self) -> None:
         if not self.lease_id or not self.attempt_id:
@@ -64,6 +68,14 @@ class LeaseRequest:
             raise ValueError("lease renewal TTL must be positive")
         if self.replace_idle_actors and self.reuse_actor_id is not None:
             raise ValueError("an assignment cannot replace and reuse a resident actor")
+        if self.runtime_switch_actor_id is not None and (
+            not self.replace_idle_actors
+            or not self.allow_actor_reuse
+            or not self.runtime_switch_model_key
+            or not self.runtime_switch_process_ids
+            or any(pid <= 0 for pid in self.runtime_switch_process_ids)
+        ):
+            raise ValueError("runtime replacement requires exact site-private ownership proof")
 
 
 @dataclass(frozen=True, slots=True)
@@ -298,7 +310,12 @@ class LeaseFenceStore:
                             )
                     else:
                         reuse_actor_id = request.reuse_actor_id or implicit_reuse_actor_id
-                        if (
+                        switching = (
+                            request.runtime_switch_actor_id == allocation["actor_id"]
+                            and request.runtime_switch_model_key == allocation["model_key"]
+                            and allocation["state"] == "idle"
+                        )
+                        if not switching and (
                             reuse_actor_id is None
                             or allocation["actor_id"] != reuse_actor_id
                             or allocation["state"] != "idle"
@@ -311,6 +328,21 @@ class LeaseFenceStore:
                                 f"GPU {gpu_uuid} is allocated to actor "
                                 f"{allocation['actor_id']} ({allocation['state']})"
                             )
+
+                if request.runtime_switch_actor_id is not None and not idempotent:
+                    members = connection.execute(
+                        "SELECT gpu_uuid, model_key, state, replica_rank FROM actor_allocations "
+                        "WHERE actor_id = ? ORDER BY replica_rank",
+                        (request.runtime_switch_actor_id,),
+                    ).fetchall()
+                    if tuple(row["gpu_uuid"] for row in members) != request.gpu_uuids or any(
+                        row["state"] != "idle"
+                        or row["model_key"] != request.runtime_switch_model_key
+                        for row in members
+                    ):
+                        raise GPUUnavailableError(
+                            "runtime replacement requires the complete exact idle replica"
+                        )
 
                 if 0 < existing_claims < len(request.gpu_uuids):
                     raise GPUUnavailableError("partial replay of a multi-GPU lease was rejected")
@@ -1672,6 +1704,23 @@ class AdmissionController:
             )
             if safe:
                 pressure_safe.add(gpu_uuid)
+            if request.runtime_switch_actor_id is not None:
+                # Reclaim only the exact old worker's VRAM, never arbitrary
+                # managed/foreign processes or another member of a larger gang.
+                processes = snapshot.topodrome_processes
+                valid = (
+                    bool(processes)
+                    and all(
+                        process.pid in request.runtime_switch_process_ids
+                        and process.used_memory_bytes is not None
+                        for process in processes
+                    )
+                    and snapshot.free_memory_bytes
+                    + sum(process.used_memory_bytes or 0 for process in processes)
+                    >= required
+                )
+                if not valid:
+                    pressure_safe.discard(gpu_uuid)
             no_managed_process = not snapshot.topodrome_processes
             cooperative_only = bool(snapshot.cooperative_processes) and safe
             utilization_safe = (
@@ -1688,6 +1737,22 @@ class AdmissionController:
                 fresh_eligible.add(gpu_uuid)
 
         implicit_reuse_actor_id: str | None = None
+        if request.runtime_switch_actor_id is not None and not self._fences.owns_claims(
+            request.lease_id, request.gpu_uuids
+        ):
+            allocations = tuple(self._fences.actor_allocation(uuid) for uuid in request.gpu_uuids)
+            if self.warm_actor_validator is None or any(
+                item is None
+                or item.actor_id != request.runtime_switch_actor_id
+                or not self.warm_actor_validator(item)
+                for item in allocations
+            ):
+                return AdmissionDecision(
+                    False,
+                    request.lease_id,
+                    request.gpu_uuids,
+                    reason="runtime replacement ownership changed",
+                )
         if request.allow_actor_reuse and request.reuse_actor_id is None:
             allocations = tuple(
                 self._fences.actor_allocation(gpu_uuid) for gpu_uuid in request.gpu_uuids

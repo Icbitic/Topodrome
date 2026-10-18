@@ -528,7 +528,6 @@ def _site_environment_key_allowed(key: str) -> bool:
     return (
         key.startswith("TOPODROME_SITE_")
         or key in {"TOPODROME_HF_TOKEN", "HF_TOKEN"}
-        or key.startswith("RCLONE_")
     )
 
 

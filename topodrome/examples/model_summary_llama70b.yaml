@@ -1,7 +1,7 @@
 source_dir: .
 entrypoint: model_summary.py
 model:
-  alias: meta-llama-3-70b-instruct
+  repo_id: meta-llama/Meta-Llama-3-70B-Instruct
   parallelism:
     mode: model_sharded
     degree: 2

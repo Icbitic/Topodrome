@@ -23,16 +23,16 @@ from topodrome.protocol.fencing import FenceEpochs, FencingAuthority
 def test_job_spec_parses_public_shape_and_rejects_traversal() -> None:
     spec = JobSpec(
         entrypoint="experiments/label_heads.py",
-        model="meta-llama-3-8b-instruct",
+        model="meta-llama/Meta-Llama-3-8B-Instruct",
         assets={"evaluation": "asset://shared/mmlu@v1"},
         resources={"gpu": 1, "min_vram_gb": 15},
     )
-    assert spec.model.alias == "meta-llama-3-8b-instruct"
+    assert spec.model.repo_id == "meta-llama/Meta-Llama-3-8B-Instruct"
     assert spec.assets["evaluation"].source_ref == "asset://shared/mmlu@v1"
     assert not spec.assets["evaluation"].pinned
     assert spec.resources.gpu_count == 1
     with pytest.raises(ValidationError):
-        JobSpec(entrypoint="../escape.py", model="x")
+        JobSpec(entrypoint="../escape.py", model="test/x")
 
 
 def test_job_spec_asset_pins_are_complete_and_aliases_are_safe() -> None:
@@ -44,7 +44,7 @@ def test_job_spec_asset_pins_are_complete_and_aliases_are_safe() -> None:
     }
     pinned = JobSpec(
         entrypoint="experiment.py",
-        model="model",
+        model="test/model",
         assets={
             "lens": {
                 "source_ref": "job://job-1/params.pt",
@@ -61,13 +61,13 @@ def test_job_spec_asset_pins_are_complete_and_aliases_are_safe() -> None:
     with pytest.raises(ValidationError, match="kind, digest, total_bytes, and members"):
         JobSpec(
             entrypoint="experiment.py",
-            model="model",
+            model="test/model",
             assets={"lens": {"source_ref": "job://job-1/params.pt", "digest": "b" * 64}},
         )
     with pytest.raises(ValidationError, match="safe single path components"):
         JobSpec(
             entrypoint="experiment.py",
-            model="model",
+            model="test/model",
             assets={"../lens": "job://job-1/params.pt"},
         )
 
@@ -103,7 +103,7 @@ def test_runtime_environment_requires_content_addressed_dependencies() -> None:
 def test_runtime_fingerprint_is_stable_and_covers_environment_and_resources() -> None:
     base = JobSpec(
         entrypoint="experiment.py",
-        model="model",
+        model="test/model",
         resources={"gpu": 1, "cpu": 2, "memory_gb": 4},
         runtime={
             "pip": [f"einops==0.8.0 --hash=sha256:{'b' * 64}"],
@@ -113,7 +113,7 @@ def test_runtime_fingerprint_is_stable_and_covers_environment_and_resources() ->
     )
     reordered = JobSpec(
         entrypoint="experiment.py",
-        model="model",
+        model="test/model",
         resources={"gpu": 1, "cpu": 2, "memory_gb": 4},
         runtime={
             "pip": [f"einops==0.8.0 --hash=sha256:{'b' * 64}"],
@@ -134,14 +134,14 @@ def test_multi_gpu_intent_is_explicit_and_part_of_runtime_identity() -> None:
     with pytest.raises(ValidationError, match="multi-GPU intent must be explicit"):
         JobSpec(
             entrypoint="experiment.py",
-            model="model",
+            model="test/model",
             resources={"gpu": 2, "min_vram_gb": 10},
         )
 
     sharded = JobSpec(
         entrypoint="experiment.py",
         model={
-            "alias": "model",
+            "repo_id": "test/model",
             "parallelism": {
                 "mode": "model_sharded",
                 "degree": 2,
@@ -153,7 +153,7 @@ def test_multi_gpu_intent_is_explicit_and_part_of_runtime_identity() -> None:
     distributed = JobSpec(
         entrypoint="experiment.py",
         model={
-            "alias": "model",
+            "repo_id": "test/model",
             "parallelism": {"mode": "distributed", "degree": 2},
         },
         resources={"gpu": 2, "min_vram_gb": 10},
@@ -169,7 +169,7 @@ def test_model_sharding_fails_closed_on_unsafe_memory_or_replica_metadata() -> N
         JobSpec(
             entrypoint="experiment.py",
             model={
-                "alias": "model",
+                "repo_id": "test/model",
                 "parallelism": {
                     "mode": "model_sharded",
                     "degree": 2,
@@ -180,7 +180,7 @@ def test_model_sharding_fails_closed_on_unsafe_memory_or_replica_metadata() -> N
         )
     with pytest.raises(ValidationError, match="must belong"):
         ModelCapability(
-            alias="model",
+            repo_id="test/model",
             revision="rev",
             backend="transformers",
             backend_version="1",
@@ -227,13 +227,13 @@ def test_job_kwargs_reject_nested_credentials_without_rejecting_tokenizer_option
         with pytest.raises(ValidationError, match="credentials"):
             JobSpec(
                 entrypoint="experiment.py",
-                model="model",
+                model="test/model",
                 kwargs=kwargs,
             )
 
     spec = JobSpec(
         entrypoint="experiment.py",
-        model="model",
+        model="test/model",
         kwargs={
             "tokenizer_name": "local-tokenizer",
             "max_new_tokens": 8,

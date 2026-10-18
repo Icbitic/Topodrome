@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 from typing import Annotated, Any
 from urllib.parse import urlsplit
+from uuid import uuid4
 
 import typer
 from pydantic import BaseModel
@@ -13,6 +14,7 @@ from topodrome.client.config import DEFAULT_URL, save_client_connection
 from topodrome.client.dashboard import DashboardRefreshError, watch_dashboard
 from topodrome.client.log_follow import follow_job
 from topodrome.client.yaml_spec import load_job_file
+from topodrome.domain.scheduling import SitePreferenceRequest
 from topodrome.domain.specs import (
     GPUReservationExtensionRequest,
     GPUReservationRequest,
@@ -24,6 +26,72 @@ from topodrome.domain.specs import (
 from topodrome.scheduler.assets import AssetPublishRequest, AssetTagUpdate, normalize_tags
 
 app = typer.Typer(no_args_is_help=True, help="Submit and inspect Topodrome workloads.")
+upgrade_app = typer.Typer(no_args_is_help=True, help="Operator idle-gated release management.")
+app.add_typer(upgrade_app, name="upgrade")
+
+
+@upgrade_app.command("queue")
+def queue_upgrade(
+    plan: Path,
+    pause: Annotated[str, typer.Option(help="Pause dispatch: none, targets, or all.")] = "targets",
+    idempotency_key: Annotated[str | None, typer.Option()] = None,
+) -> None:
+    """Freeze a protected operator plan on Lab1; the external updater waits for idle."""
+    from pydantic import ValidationError
+
+    from topodrome.domain.upgrades import UpgradeRequest
+
+    try:
+        request = UpgradeRequest(plan_path=plan.absolute(), pause=pause,
+                                 idempotency_key=idempotency_key or uuid4().hex)
+    except ValidationError:
+        raise typer.BadParameter("pause must be none, targets, or all") from None
+    with Client() as client:
+        _print(client.queue_upgrade(request))
+
+
+@upgrade_app.command("status")
+def upgrade_status(upgrade_id: str | None = None) -> None:
+    """Show sanitized upgrade state and idle blockers."""
+    with Client() as client:
+        records = client.upgrades()
+    if upgrade_id is not None:
+        records = [r for r in records if r["upgrade_id"] == upgrade_id]
+    _print(records)
+
+
+@upgrade_app.command("cancel")
+def cancel_upgrade(upgrade_id: str) -> None:
+    """Cancel an upgrade before live mutation; running jobs are never canceled."""
+    with Client() as client:
+        _print(client.cancel_upgrade(upgrade_id))
+
+
+@upgrade_app.command("recover")
+def recover_upgrade(
+    upgrade_id: str,
+    action: Annotated[str, typer.Option(help="Explicit recovery: verify or rollback.")],
+) -> None:
+    """Resolve an interrupted deployment without blindly repeating its apply command."""
+    if action not in {"verify", "rollback"}:
+        raise typer.BadParameter("action must be verify or rollback")
+    with Client() as client:
+        _print(client.recover_upgrade(upgrade_id, action=action))
+
+
+@upgrade_app.command("pause")
+def pause_upgrade(
+    upgrade_id: str,
+    scope: Annotated[str, typer.Option(help="Dispatch scope: none, targets, or all.")],
+) -> None:
+    """Change dispatch draining while an upgrade is still waiting; none resumes intake."""
+    if scope not in {"none", "targets", "all"}:
+        raise typer.BadParameter("scope must be none, targets, or all")
+    with Client() as client:
+        record = next((r for r in client.upgrades() if r["upgrade_id"] == upgrade_id), None)
+        if record is None:
+            raise typer.BadParameter("upgrade does not exist")
+        _print(client.change_upgrade_pause(upgrade_id, pause=scope, expected_pause=record["pause"]))
 
 
 @app.command("storage-gc")
@@ -434,6 +502,14 @@ def asset_upload(
         )
 
 
+@app.command("download")
+def download(reference: str, destination: Path) -> None:
+    """Download a job:// or asset:// file or directory; resume interrupted transfers."""
+    with Client() as client:
+        path = client.download(reference, destination)
+        _print({"path": str(path)})
+
+
 @app.command("asset-download")
 def asset_download(
     name: str,
@@ -454,6 +530,9 @@ def asset_download(
 
 @app.command("assets")
 def assets(
+    all_versions: Annotated[
+        bool, typer.Option("--all-versions", help="Include older versions.")
+    ] = False,
     visibility: Annotated[
         str | None,
         typer.Option("--visibility", help="Filter by private or shared visibility."),
@@ -463,7 +542,7 @@ def assets(
         list[str] | None, typer.Option("--tag", help="Require each tag (repeatable).")
     ] = None,
 ) -> None:
-    """List reusable assets visible to the current user."""
+    """List the latest publication per asset name; --all-versions includes history."""
 
     if visibility not in {None, "private", "shared"}:
         raise typer.BadParameter("--visibility must be private or shared")
@@ -472,7 +551,9 @@ def assets(
     except ValueError as exc:
         raise typer.BadParameter(str(exc)) from None
     with Client() as client:
-        _print(client.assets(visibility=visibility, limit=limit, tags=tags))
+        _print(
+            client.assets(visibility=visibility, limit=limit, tags=tags, all_versions=all_versions)
+        )
 
 
 @app.command("asset-delete")
@@ -547,6 +628,8 @@ def asset(
 @app.command()
 def kernel(
     model: Annotated[str, typer.Option("--model")],
+    revision: Annotated[str | None, typer.Option("--revision")] = None,
+    subfolder: Annotated[str | None, typer.Option("--subfolder")] = None,
     mode: Annotated[str, typer.Option("--mode")] = "raw-model",
     min_vram_gb: Annotated[float, typer.Option("--min-vram-gb")] = 0,
     gpus: Annotated[
@@ -588,9 +671,11 @@ def kernel(
         else None
     )
     model_requirement = (
-        ModelRequirement(alias=model, parallelism=parallelism)
+        ModelRequirement(
+            repo_id=model, revision=revision, subfolder=subfolder, parallelism=parallelism,
+        )
         if parallelism is not None
-        else ModelRequirement(alias=model)
+        else ModelRequirement(repo_id=model, revision=revision, subfolder=subfolder)
     )
     request = KernelRequest(
         model=model_requirement,
@@ -650,6 +735,27 @@ def sites() -> None:
         _print(client.sites())
 
 
+@app.command("site-preference")
+def site_preference(
+    site_ids: Annotated[
+        list[str] | None, typer.Argument(help="Preferred sites, first to last.")
+    ] = None,
+    automatic: Annotated[bool, typer.Option(help="Clear site preferences.")] = False,
+) -> None:
+    """Inspect or change future placement order live; running work is untouched."""
+    if site_ids and automatic:
+        raise typer.BadParameter("provide site IDs or --automatic, not both")
+    with Client() as client:
+        policy = client.system_status()["policy"]
+        if not site_ids and not automatic:
+            _print(policy)
+            return
+        request = SitePreferenceRequest(
+            preferred_site_ids=tuple(site_ids or ()), expected_generation=policy["generation"],
+        )
+        _print(client.set_site_preference(request))
+
+
 @app.command()
 def gpus() -> None:
     with Client() as client:
@@ -657,9 +763,15 @@ def gpus() -> None:
 
 
 @app.command()
-def models() -> None:
+def models(
+    repo_id: Annotated[
+        str | None,
+        typer.Option("--repo", "--repo-id", help="Filter by registered owner/repository ID."),
+    ] = None,
+) -> None:
+    """List model snapshots, registered step/ref labels, and site availability."""
     with Client() as client:
-        _print(client.models())
+        _print(client.models(repo_id=repo_id))
 
 
 @app.command("gpu-reserve")

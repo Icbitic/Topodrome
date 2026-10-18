@@ -40,7 +40,7 @@ async def test_named_asset_publish_and_consume_through_api(
     producer_spec = JobSpec(
         entrypoint="producer.py",
         source_ref="sha256:" + "0" * 64,
-        model="model-a",
+        model="test/model-a",
     )
     async with database.transaction() as session:
         session.add(
@@ -103,6 +103,18 @@ async def test_named_asset_publish_and_consume_through_api(
         ]
         assert await client.assets(visibility="shared") == [published]
         assert await client.asset("tuned-lens", "v1", visibility="shared") == published
+        newer = await client.publish_asset(
+            name="tuned-lens",
+            version="v2",
+            job_id=producer_job_id,
+            path="lens/",
+            visibility="shared",
+        )
+        assert await client.assets() == [newer]
+        assert await client.assets(all_versions=True) == [newer, published]
+        assert await client.assets(limit=1, all_versions=True) == [newer]
+        await client.delete_asset("tuned-lens", "v2", visibility="shared")
+        assert await client.assets() == [published]
         downloaded = await client.download_asset(
             "tuned-lens", "v1", tmp_path / "downloaded-lens", visibility="shared"
         )
@@ -112,7 +124,7 @@ async def test_named_asset_publish_and_consume_through_api(
         consumer = await client.submit(
             entrypoint="consumer.py",
             source_dir=source,
-            model="model-a",
+            model="test/model-a",
             assets={"lens": published.ref},
         )
 
@@ -136,7 +148,7 @@ async def test_named_asset_publish_and_consume_through_api(
             await client.submit(
                 entrypoint="consumer.py",
                 source_dir=source,
-                model="model-a",
+                model="test/model-a",
                 assets={"lens": published.ref},
             )
         with pytest.raises(RuntimeError, match="409"):

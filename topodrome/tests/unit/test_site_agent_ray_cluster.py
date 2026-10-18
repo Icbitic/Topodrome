@@ -15,7 +15,7 @@ from topodrome.site_agent.ray_cluster import (
     SubprocessRayLifecycle,
 )
 
-pytestmark = pytest.mark.unit
+pytestmark = [pytest.mark.unit, pytest.mark.usefixtures("ray_alias_tmpfs")]
 
 
 class _FakeHeadProcess:

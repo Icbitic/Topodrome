@@ -6,7 +6,7 @@ checkpoint uploads inside `_latest_checkpoint`, lasting about two hours. Those
 uploads delayed terminal reports even though the corresponding GPU processes
 no longer existed. Cancellation could not kill an already-missing worker.
 
-Recovery stopped only two positively identified child `rclone copyto` processes
+Recovery stopped only two positively identified child transfer processes
 uploading checkpoints for those dead attempts. No checkpoint files were deleted,
 no Ray head or site agent was restarted, and no live experiment was signalled.
 Both previously stuck canceled Jupyter jobs now report `canceled`; Gemma's

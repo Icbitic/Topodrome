@@ -24,7 +24,7 @@ def _gpu(
     index: int,
     *,
     actor_id: str | None = None,
-    alias: str = "llama",
+    repo_id: str = "test/llama",
     members: tuple[str, ...] | None = None,
     foreign: bool = False,
     active_lease: bool = False,
@@ -48,7 +48,7 @@ def _gpu(
         actor_state=ActorState.IDLE if actor_id else None,
         actor_key_data=(
             {
-                "alias": alias,
+                "repo_id": repo_id,
                 "revision": "rev",
                 "backend": "transformers",
                 "backend_version": "4.57.6",
@@ -86,8 +86,8 @@ def _site(site_id: str, gpus: tuple[GPUCandidate, ...]) -> SiteCandidate:
     )
 
 
-def _job(alias: str) -> JobSpec:
-    return JobSpec(entrypoint="experiment.py", model={"alias": alias})
+def _job(repo_id: str) -> JobSpec:
+    return JobSpec(entrypoint="experiment.py", model={"repo_id": repo_id})
 
 
 def _choose(
@@ -146,7 +146,7 @@ def test_contention_shedding_requires_threshold_stability_and_preserves_one_acto
         )
     ]
 
-    queued = (_job("queued-model"),)
+    queued = (_job("test/queued-model"),)
     assert _choose(policy, sites, queued, now=0) is None
     assert _choose(policy, sites, queued, now=29.999) is None
     plan = _choose(policy, sites, queued, now=30)
@@ -193,7 +193,7 @@ def test_excess_idle_timeout_uses_durable_age_and_preserves_floor_for_queue() ->
         )
     ]
 
-    queued = (_job("queued-model"),)
+    queued = (_job("test/queued-model"),)
     assert _choose(policy, sites, queued, now=1199.999, threshold=5) is None
     restarted_policy = InstitutionalActorPolicy()
     plan = _choose(restarted_policy, sites, queued, now=1200, threshold=5)
@@ -213,7 +213,7 @@ def test_per_site_idle_timeouts_preserve_default_floor_and_active_work() -> None
         assert _choose(policy, sites, now=expiry - 0.001, overrides=overrides) is None
         plan = _choose(policy, sites, now=expiry, overrides=overrides)
         assert plan is not None and plan.minimum_idle_seconds == expiry
-        assert _choose(policy, sites, (_job("model"),), now=5000, overrides=overrides) is None
+        assert _choose(policy, sites, (_job("test/model"),), now=5000, overrides=overrides) is None
         busy = [_site(site_id, (replace(gpu, active_lease=True),))]
         assert _choose(policy, busy, now=5000, overrides=overrides) is None
     sites = [_site("lab1", (_gpu("lab1", 0, actor_id="warm"),))]
@@ -239,8 +239,8 @@ def test_queue_demand_prefers_shedding_an_unrequested_model() -> None:
         _site(
             "lab1",
             (
-                _gpu("lab1", 0, actor_id="llama", alias="llama", foreign=True),
-                _gpu("lab1", 1, actor_id="gemma", alias="gemma", foreign=True),
+                _gpu("lab1", 0, actor_id="llama", repo_id="test/llama", foreign=True),
+                _gpu("lab1", 1, actor_id="gemma", repo_id="test/gemma", foreign=True),
                 _gpu("lab1", 2, active_lease=True),
                 _gpu("lab1", 3, active_lease=True),
                 _gpu("lab1", 4, active_lease=True),
@@ -248,7 +248,7 @@ def test_queue_demand_prefers_shedding_an_unrequested_model() -> None:
         )
     ]
 
-    plan = _choose(policy, sites, (_job("gemma"),), now=0, stability=0)
+    plan = _choose(policy, sites, (_job("test/gemma"),), now=0, stability=0)
     assert plan is not None
     assert plan.actor_id == "llama"
 

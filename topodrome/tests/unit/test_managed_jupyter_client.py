@@ -76,7 +76,7 @@ async def test_authenticated_api_and_async_sdk_return_ide_connection(
         managed_jupyter_controller=cast(Any, controller),
     )
     now = utc_now()
-    request = KernelRequest(model="model", resources={"gpu": 1})
+    request = KernelRequest(model="test/model", resources={"gpu": 1})
     async with database.transaction() as session:
         session.add(
             KernelSessionRow(

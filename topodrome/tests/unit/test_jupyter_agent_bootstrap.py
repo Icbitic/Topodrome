@@ -50,12 +50,10 @@ def test_site_environment_accepts_only_agent_runtime_keys() -> None:
     values = jupyter_agent._parse_site_environment(
         b"TOPODROME_SITE_ENROLLMENT_TOKEN='site secret'\n"
         b"HF_TOKEN=hf-secret\n"
-        b"RCLONE_CONFIG_REGIONAL_TYPE=s3\n"
     )
     assert values == {
         "TOPODROME_SITE_ENROLLMENT_TOKEN": "site secret",
         "HF_TOKEN": "hf-secret",
-        "RCLONE_CONFIG_REGIONAL_TYPE": "s3",
     }
 
     with pytest.raises(ValueError, match="unsupported key"):

@@ -41,17 +41,25 @@ ssh_local_forward:
   ssh_executable: /usr/bin/ssh
   startup_timeout_seconds: 30
   shutdown_timeout_seconds: 10
-rclone:
-  verification_via_scheduler: true
-  # Direct SFTP mirroring avoids a FUSE dependency on replaceable workers.
-  mode: mirror
-  mountpoint: /root/autodl-tmp/topodrome-global
-  remote: 'lab1-global:'
-  # Required for mount-mode compatibility; direct mirror mode does not use it.
-  cache_dir: /root/autodl-tmp/rclone-vfs-cache
-  # The generated release supplies this credential-free executable on PATH.
-  binary: rclone
+# Independent outer TCP connection: bulk traffic cannot saturate control.
+bulk_ssh_local_forward:
+  identity_file: /root/autodl-fs/topodrome/secrets/control_ed25519
+  known_hosts_file: /root/autodl-fs/topodrome/secrets/lab1_known_hosts
+  remote_host: 111.127.53.162
+  remote_user: xiangkun
+  remote_port: 2201
+  local_host: 127.0.0.1
+  local_port: 18043
+  target_host: 127.0.0.1
+  target_port: 8042
+  state_directory: /root/autodl-tmp/topodrome/bulk-tunnel
+  ssh_executable: /usr/bin/ssh
+  startup_timeout_seconds: 30
+  shutdown_timeout_seconds: 10
+storage:
+  bulk_url: http://127.0.0.1:18043
+  small_file_max_bytes: 1048576
   min_free_space_gb: 10
-  poll_interval_seconds: 5
+  request_timeout_seconds: 30
   verification_timeout_seconds: 120
   transfer_timeout_seconds: 21600

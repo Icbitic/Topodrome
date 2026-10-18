@@ -25,8 +25,9 @@ InstitutionalActorEvictionReason = Literal[
 ]
 
 _MODEL_IDENTITY_KEYS = (
-    "alias",
+    "repo_id",
     "revision",
+    "subfolder",
     "backend",
     "backend_version",
     "dtype",
@@ -194,7 +195,9 @@ class InstitutionalActorPolicy:
             )
             <= observed_at
         ]
-        demanded_aliases = {spec.model.alias for spec in queued_specs}
+        demanded_repositories = {
+            spec.model.repo_id for spec in queued_specs if spec.model is not None
+        }
 
         if occupied >= contention_threshold_gpu_count:
             contended = [
@@ -207,7 +210,7 @@ class InstitutionalActorPolicy:
                 selected = min(
                     contended,
                     key=lambda replica: (
-                        replica.model_identity.get("alias") in demanded_aliases,
+                        replica.model_identity.get("repo_id") in demanded_repositories,
                         len(replica.gpu_uuids),
                         -replica.foreign_memory_bytes,
                         -replica.foreign_process_count,
@@ -237,7 +240,7 @@ class InstitutionalActorPolicy:
                 selected = min(
                     expired,
                     key=lambda replica: (
-                        replica.model_identity.get("alias") in demanded_aliases,
+                        replica.model_identity.get("repo_id") in demanded_repositories,
                         replica.idle_since,
                         len(replica.gpu_uuids),
                         replica.site_id,

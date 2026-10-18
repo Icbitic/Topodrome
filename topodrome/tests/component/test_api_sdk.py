@@ -49,7 +49,7 @@ async def test_submission_source_and_status_through_sdk(database: Database, tmp_
             description="Persisted job metadata\nNo GPU execution needed.",
             estimated_runtime_seconds=120,
             source_ref=source_ref.json()["source_ref"],
-            model="meta-llama-3-8b-instruct",
+            model="meta-llama/Meta-Llama-3-8B-Instruct",
             resources={"gpu": 1, "min_vram_gb": 15},
             idempotency_key="sdk-submit-1",
         )
@@ -270,7 +270,7 @@ async def test_direct_job_api_rejects_missing_malformed_unknown_and_corrupt_sour
     app = create_app(settings, database=database, run_dispatcher=False)
     base_spec = {
         "entrypoint": "experiment.py",
-        "model": "meta-llama-3-8b-instruct",
+        "model": "meta-llama/Meta-Llama-3-8B-Instruct",
         "resources": {"gpu": 1, "min_vram_gb": 15},
     }
     async with httpx.AsyncClient(

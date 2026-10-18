@@ -1,0 +1,17 @@
+[Unit]
+Description=Topodrome idle-gated upgrade runner
+After=network-online.target topodrome-scheduler.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/ssd/xiangkun/Topodrome/topodrome
+ExecStart=/ssd/xiangkun/Topodrome/topodrome/.venv/bin/python -m topodrome.deployment.updater --config /home/xiangkun/.config/topodrome/scheduler.yaml --env-file /home/xiangkun/.config/topodrome/scheduler.env
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec=3700
+UMask=0077
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=default.target

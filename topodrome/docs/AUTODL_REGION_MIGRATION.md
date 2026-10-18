@@ -15,8 +15,8 @@ The uv environment and global mirror cache live on `/root/autodl-tmp`. The verif
 runtime seed remains reusable from regional storage; rebuilding Topodrome itself
 does not require downloading all weights or dependencies again.
 
-Every new AutoDL bootstrap enables `rclone.verification_via_scheduler: true` for
-the Lab1 global mirror. Outputs upload once; Lab1 hashes the stored bytes and
+Every new AutoDL bootstrap uses the enrolled HTTP API for the Lab1 global
+mirror and independent authority verification. Outputs upload once; Lab1 hashes the stored bytes and
 returns only size/SHA-256. Paid workers no longer download their output back just
 to verify it. Failed verification still prevents false success.
 

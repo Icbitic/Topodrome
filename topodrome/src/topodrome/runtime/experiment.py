@@ -9,18 +9,16 @@ import importlib.util
 import inspect
 import sys
 from collections.abc import Callable, Mapping
+from functools import wraps
 from pathlib import Path, PurePosixPath
-from threading import RLock
 from typing import Any, Protocol, cast
 
 from .context import ExperimentContext
+from .source_imports import SourceImports, source_imports
 
 
 class Experiment(Protocol):
     def __call__(self, context: ExperimentContext, **kwargs: Any) -> Any: ...
-
-
-_SOURCE_IMPORT_LOCK = RLock()
 
 
 def _split_file_reference(reference: str) -> tuple[str, str] | None:
@@ -55,21 +53,12 @@ def _resolve_file_entrypoint(
     if specification is None or specification.loader is None:
         raise ImportError(f"cannot load experiment entrypoint {reference!r}")
     module = importlib.util.module_from_spec(specification)
-    # Source roots may contain ordinary sibling modules. Isolate the sys.path
-    # mutation and always restore it; the loaded experiment keeps its globals.
-    with _SOURCE_IMPORT_LOCK:
-        sys.modules[module_name] = module
-        sys.path.insert(0, str(root))
-        try:
-            specification.loader.exec_module(module)
-        except BaseException:
-            sys.modules.pop(module_name, None)
-            raise
-        finally:
-            try:
-                sys.path.remove(str(root))
-            except ValueError:
-                pass
+    sys.modules[module_name] = module
+    try:
+        specification.loader.exec_module(module)
+    except BaseException:
+        sys.modules.pop(module_name, None)
+        raise
     function = getattr(module, attribute, None)
     if not callable(function):
         sys.modules.pop(module_name, None)
@@ -77,13 +66,7 @@ def _resolve_file_entrypoint(
     return cast(Experiment, function)
 
 
-def resolve_entrypoint(reference: str, *, source_root: Path | str | None = None) -> Experiment:
-    """Resolve a relative Python source file or ``package.module:function``.
-
-    Relative files default to a top-level ``run`` callable and are contained to
-    ``source_root`` after symlink resolution.
-    """
-
+def _resolve_entrypoint(reference: str, source_root: Path | str | None) -> Experiment:
     if not isinstance(reference, str) or not reference:
         raise ValueError("entrypoint must not be empty")
     file_reference = _split_file_reference(reference)
@@ -100,6 +83,28 @@ def resolve_entrypoint(reference: str, *, source_root: Path | str | None = None)
     if not callable(function):
         raise TypeError(f"entrypoint {reference!r} is not callable")
     return cast(Experiment, function)
+
+
+def resolve_entrypoint(reference: str, *, source_root: Path | str | None = None) -> Experiment:
+    """Resolve a file or ``package.module:function`` for a synchronous actor.
+
+    Relative files default to ``run`` and cannot escape ``source_root``. A
+    returned source callable reinstalls its private imports while it runs,
+    including when awaiting an async experiment. Installed entrypoints without
+    a source root retain their ordinary Python import behavior.
+    """
+    if source_root is None:
+        return _resolve_entrypoint(reference, source_root)
+    imports = SourceImports(source_root, retain=True)
+    with imports.activate():
+        target = _resolve_entrypoint(reference, source_root)
+
+    @wraps(target)
+    def isolated(context: ExperimentContext, **kwargs: Any) -> Any:
+        with imports.activate():
+            return _finish_awaitable(target(context, **kwargs))
+
+    return isolated
 
 
 async def _await_experiment(value: Any) -> Any:
@@ -128,9 +133,18 @@ def invoke_experiment(
 ) -> Any:
     """Invoke a callable or an object exposing ``run(context, **kwargs)``."""
 
+    with source_imports(context.workspace):
+        return _invoke_experiment(experiment, context, kwargs)
+
+
+def _invoke_experiment(
+    experiment: Experiment | Any,
+    context: ExperimentContext,
+    kwargs: Mapping[str, Any] | None,
+) -> Any:
     target: Callable[..., Any]
     if isinstance(experiment, str):
-        target = resolve_entrypoint(experiment, source_root=context.workspace)
+        target = _resolve_entrypoint(experiment, context.workspace)
     elif callable(experiment):
         target = experiment
     else:

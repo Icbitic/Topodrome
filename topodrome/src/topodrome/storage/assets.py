@@ -379,10 +379,12 @@ class AssetResolver:
             return self._storage.resolve(member.logical_path)
         if not callable(resolver):
             raise AssetIntegrityError("storage resolve_pinned hook is not callable")
-        value: object = resolver(
-            member.logical_path,
-            expected_size_bytes=member.size_bytes,
-        )
+        from topodrome.storage.http_mirror import HttpMirrorStorage
+
+        pinned = {"expected_size_bytes": member.size_bytes}
+        if isinstance(self._storage, HttpMirrorStorage):
+            pinned["expected_sha256"] = member.sha256
+        value: object = resolver(member.logical_path, **pinned)
         if not isinstance(value, Path):
             raise AssetIntegrityError("storage resolve_pinned hook returned an invalid path")
         return value

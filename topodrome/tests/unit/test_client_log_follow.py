@@ -26,7 +26,7 @@ def _summary(state: str) -> JobSummary:
         spec=JobSpec(
             entrypoint="run.py",
             source_ref="sha256:" + "a" * 64,
-            model="model",
+            model="test/model",
             resources={"gpu": 1},
         ),
         created_at=now,

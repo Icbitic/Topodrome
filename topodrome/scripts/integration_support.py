@@ -14,6 +14,7 @@ import io
 import json
 import os
 import re
+import shlex
 import stat
 import tarfile
 from collections.abc import Iterator, Mapping, Sequence
@@ -29,6 +30,7 @@ import httpx
 from pydantic import SecretStr
 
 from topodrome.config import SecretBundle, load_secret_bundle
+from topodrome.deployment.ssh_files import upload_bytes, upload_file
 from topodrome.jupyter.terminal import (
     TerminalChannel,
     send_terminal_command,
@@ -210,7 +212,7 @@ class SSHCommandResult:
 
 
 class ManagedSSHClient:
-    """Credential-safe SSH/SFTP access to one disposable AutoDL worker.
+    """Credential-safe SSH access to one disposable AutoDL worker.
 
     AutoDL's ``jupyter_domain`` currently exposes AutoPanel rather than a
     Jupyter Server API.  The provider snapshot also supplies a short-lived SSH
@@ -245,7 +247,6 @@ class ManagedSSHClient:
         self._password = secret
         self._max_output_chars = max_output_chars
         self._connection: Any = None
-        self._sftp: Any = None
 
     def __repr__(self) -> str:
         return f"ManagedSSHClient(host={self.host!r}, port={self.port!r}, run_id={self.run_id!r})"
@@ -277,9 +278,13 @@ class ManagedSSHClient:
                     known_hosts=None,
                     login_timeout=30,
                 )
-                self._sftp = await self._connection.start_sftp_client()
-                await self._sftp.makedirs(self.remote_root, exist_ok=True)
-                await self._sftp.chmod(self.remote_root, 0o700)
+                await upload_bytes(
+                    self._connection,
+                    self.run_id.encode(),
+                    self.remote_root,
+                    ".topodrome-integration-owner",
+                    timeout_seconds=30,
+                )
         except (KeyboardInterrupt, SystemExit):
             raise
         except Exception:
@@ -288,7 +293,6 @@ class ManagedSSHClient:
 
     async def aclose(self) -> None:
         connection, self._connection = self._connection, None
-        self._sftp = None
         if connection is not None:
             connection.close()
             with suppress(Exception):
@@ -296,19 +300,20 @@ class ManagedSSHClient:
 
     async def put_file(self, name: str, content: bytes, *, mode: int = 0o600) -> str:
         path = self._child_path(name)
-        if self._sftp is None:
+        if self._connection is None:
             raise IntegrationHarnessError("AutoDL SSH client is not connected")
         try:
-            # Proxy SSH links can be slow and AsyncSSH's single huge write can
-            # otherwise sit below the harness watchdog without a useful stage.
             timeout = min(1200.0, max(60.0, len(content) / 32768.0))
-            async with asyncio.timeout(timeout):
-                async with self._sftp.open(path, "wb") as handle:
-                    for offset in range(0, len(content), 1024 * 1024):
-                        await handle.write(content[offset : offset + 1024 * 1024])
-                await self._sftp.chmod(path, mode)
+            await upload_bytes(
+                self._connection,
+                content,
+                self.remote_root,
+                name,
+                mode=mode,
+                timeout_seconds=timeout,
+            )
         except Exception:
-            raise IntegrationHarnessError("AutoDL SFTP upload failed") from None
+            raise IntegrationHarnessError("AutoDL SSH installation upload failed") from None
         return path
 
     async def put_path(
@@ -326,7 +331,7 @@ class ManagedSSHClient:
         """
 
         path = self._child_path(name)
-        if self._sftp is None:
+        if self._connection is None:
             raise IntegrationHarnessError("AutoDL SSH client is not connected")
         if mode < 0 or mode & ~0o777:
             raise ValueError("remote file mode must contain only permission bits")
@@ -335,22 +340,23 @@ class ManagedSSHClient:
             if not stat.S_ISREG(metadata.st_mode):
                 raise OSError
         except OSError:
-            raise IntegrationHarnessError("local SFTP upload source is unavailable") from None
+            raise IntegrationHarnessError(
+                "local installation upload source is unavailable"
+            ) from None
         try:
             timeout = min(1200.0, max(60.0, metadata.st_size / 32768.0))
-            async with asyncio.timeout(timeout):
-                source = await asyncio.to_thread(local_path.open, "rb")
-                try:
-                    async with self._sftp.open(path, "wb") as target:
-                        while chunk := await asyncio.to_thread(source.read, 1024 * 1024):
-                            await target.write(chunk)
-                finally:
-                    await asyncio.to_thread(source.close)
-                await self._sftp.chmod(path, mode)
+            await upload_file(
+                self._connection,
+                local_path,
+                self.remote_root,
+                name,
+                mode=mode,
+                timeout_seconds=timeout,
+            )
         except (KeyboardInterrupt, SystemExit):
             raise
         except Exception:
-            raise IntegrationHarnessError("AutoDL SFTP upload failed") from None
+            raise IntegrationHarnessError("AutoDL SSH installation upload failed") from None
         return path
 
     async def run(self, command: str, *, timeout_seconds: float) -> SSHCommandResult:
@@ -375,12 +381,24 @@ class ManagedSSHClient:
         return SSHCommandResult(output=safe, exit_status=int(result.exit_status or 0))
 
     async def cleanup(self) -> None:
-        if self._sftp is None:
+        if self._connection is None:
             return
         try:
-            await self._sftp.rmtree(self.remote_root, ignore_errors=True)
+            script = (
+                "import os, pathlib, shutil, stat, sys; "
+                "root, owner = sys.argv[1:]; "
+                "metadata = os.lstat(root); "
+                "assert stat.S_ISDIR(metadata.st_mode) and metadata.st_uid == os.geteuid(); "
+                "assert pathlib.Path(root, '.topodrome-integration-owner').read_text() == owner; "
+                "shutil.rmtree(root)"
+            )
+            await self._connection.run(
+                shlex.join(["python3", "-c", script, self.remote_root, self.run_id]),
+                check=True,
+                timeout=30,
+            )
         except Exception:
-            raise IntegrationHarnessError("AutoDL SFTP cleanup failed") from None
+            raise IntegrationHarnessError("AutoDL owned SSH directory cleanup failed") from None
 
     def _child_path(self, name: str) -> str:
         if not re.fullmatch(r"[A-Za-z0-9_.-]+", name) or name in {".", ".."}:

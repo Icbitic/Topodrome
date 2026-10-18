@@ -17,6 +17,7 @@ def test_scheduler_cli_keeps_uvicorn_on_the_redacting_root_logger(
     settings = SimpleNamespace(
         api_host="127.0.0.1",
         api_port=8042,
+        api_keepalive_seconds=300,
         validate_api_bind_host=lambda host: host,
     )
     application = object()
@@ -38,5 +39,6 @@ def test_scheduler_cli_keeps_uvicorn_on_the_redacting_root_logger(
         "app": application,
         "host": "127.0.0.1",
         "port": 8042,
+        "timeout_keep_alive": 300,
         "log_config": None,
     }

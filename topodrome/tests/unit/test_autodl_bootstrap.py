@@ -8,7 +8,9 @@ import shutil
 import subprocess
 import sys
 import tarfile
+import threading
 import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from io import BytesIO
 from pathlib import Path
 from typing import Any
@@ -21,6 +23,68 @@ from topodrome.deployment.autodl import build_autodl_bootstrap
 pytestmark = pytest.mark.unit
 
 
+_HTTP_FIXTURES = {}
+
+
+@pytest.fixture(autouse=True)
+def close_http_fixtures():
+    yield
+    for server, thread, _, _ in _HTTP_FIXTURES.values():
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=3)
+    _HTTP_FIXTURES.clear()
+
+
+def _http_seed_fixture(tmp_path, copied_seed=None):
+    log = tmp_path / "http-requests.log"
+
+    class Handler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def do_GET(self):
+            if copied_seed is None:
+                self.send_response(503)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+            data = copied_seed.read_bytes()
+            identity = hashlib.sha256(data).hexdigest()
+            if self.headers.get("Authorization") != "Bearer enrollment-test-value":
+                self.send_response(403)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+            if self.path.startswith("/api/v1/agents/storage/stat?"):
+                content = json.dumps({"IsDir": False, "Size": len(data), "ID": identity}).encode()
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(content)))
+                self.end_headers()
+                self.wfile.write(content)
+                return
+            assert self.path.startswith("/api/v1/agents/storage/file?")
+            assert self.headers["If-Match"] == '"' + identity + '"'
+            offset = int(self.headers["Range"][6:].split("-", 1)[0])
+            with log.open("a") as handle:
+                handle.write("GET HTTP seed range " + str(offset) + "\n")
+            self.send_response(206)
+            self.send_header("ETag", '"' + identity + '"')
+            self.send_header("Content-Range", f"bytes {offset}-{len(data) - 1}/{len(data)}")
+            self.send_header("Content-Length", str(len(data) - offset))
+            self.end_headers()
+            self.wfile.write(data[offset:])
+
+        def log_message(self, *_):
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    origin = f"http://127.0.0.1:{server.server_port}"
+    _HTTP_FIXTURES[str(tmp_path)] = (server, thread, origin, log)
+    return origin, log
+
+
 def _site_config() -> dict[str, Any]:
     return {
         "site_id": "autodl",
@@ -28,26 +92,19 @@ def _site_config() -> dict[str, Any]:
         "scheduler_url": "https://scheduler.lab1.example",
         "site_kind": "autodl",
         "provider_instance_id": None,
-        "global_root": "/mnt/topodrome-global",
+        "global_root": "/root/autodl-tmp/topodrome-global",
         "scratch_root": "/root/autodl-tmp/topodrome",
         "persistent_root": "/root/autodl-fs/topodrome",
         "spool_path": "/root/autodl-fs/topodrome/agent-spool.sqlite3",
         "model_config": "/a/local/path/that/must/not/be-bundled.yaml",
-        "rclone": {
-            "mountpoint": "/mnt/topodrome-global",
-            "remote": "lab1:topodrome",
-            "cache_dir": "/root/autodl-tmp/rclone-cache",
-            "binary": "/a/local/rclone",
-            "vfs_cache_max_size_gb": 20,
-            "min_free_space_gb": 10,
-        },
+        "storage": {"authority_id": "lab1-global", "bulk_url": "https://scheduler.lab1.example"},
     }
 
 
 def _model_config() -> dict[str, Any]:
     return {
         "models": {
-            "meta-llama-3-8b-instruct": {
+            "meta-llama/Meta-Llama-3-8B-Instruct": {
                 "revision": "8afb486c1db24fe5011ec46dfbe5b5dccdb575c2",
                 "backend": "transformers",
                 "backend_version": "4.57.6",
@@ -81,24 +138,27 @@ def _build(
     tmp_path: Path,
     *,
     uv_body: str = "exit 0\n",
-    rclone_body: str = "exit 0\n",
     runtime_seed: Path | None = None,
     runtime_seed_remote: str | None = None,
     runtime_seed_platform: str | None = None,
     allow_online_fallback: bool = False,
 ) -> Any:
     repository = Path(__file__).resolve().parents[2]
-    site = _write_yaml(tmp_path / "site.yaml", _site_config())
+    site_value = _site_config()
+    if runtime_seed is not None:
+        if str(tmp_path) not in _HTTP_FIXTURES:
+            _http_seed_fixture(tmp_path)
+        site_value["global_root"] = "/root/autodl-tmp/topodrome-global"
+        site_value["storage"] = {"bulk_url": _HTTP_FIXTURES[str(tmp_path)][2]}
+    site = _write_yaml(tmp_path / "site.yaml", site_value)
     models = _write_yaml(tmp_path / "models.yaml", _model_config())
     uv = _tool(tmp_path / "uv", uv_body)
-    rclone = _tool(tmp_path / "rclone", rclone_body)
     return build_autodl_bootstrap(
         repository_root=repository,
         site_config=site,
         model_config=models,
         output_dir=tmp_path / "persistent" / "bootstrap",
         uv_binary=uv,
-        rclone_binary=rclone,
         runtime_seed=runtime_seed,
         runtime_seed_remote=runtime_seed_remote,
         runtime_seed_platform=runtime_seed_platform,
@@ -138,9 +198,6 @@ def _bootstrap_environment(
     ephemeral = tmp_path / "ephemeral"
     secrets = persistent / "secrets"
     secrets.mkdir(mode=0o700, exist_ok=True)
-    rclone_config = secrets / "rclone.conf"
-    rclone_config.write_text("[lab1]\ntype = sftp\nhost = lab1.internal\n", encoding="utf-8")
-    rclone_config.chmod(0o600)
     result_path = tmp_path / "agent-result.txt"
     secret_file = secrets / "site.env"
     secret_file.write_text(
@@ -149,7 +206,6 @@ def _bootstrap_environment(
                 "TOPODROME_SITE_ENROLLMENT_TOKEN='enrollment-test-value'",
                 f"TOPODROME_SITE_FENCE_VERIFICATION_KEY='{'f' * 32}'",
                 "TOPODROME_HF_TOKEN='hf_test_value_not_a_real_token'",
-                f"RCLONE_CONFIG='{rclone_config}'",
                 f"TOPODROME_BOOTSTRAP_TEST_RESULT='{result_path}'",
                 "",
             )
@@ -218,7 +274,6 @@ def _seeded_uv_body(
 [ -z "${{TOPODROME_SITE_ENROLLMENT_TOKEN:-}}" ]
 [ -z "${{TOPODROME_SITE_FENCE_VERIFICATION_KEY:-}}" ]
 [ -z "${{TOPODROME_HF_TOKEN:-}}" ]
-[ -z "${{RCLONE_CONFIG:-}}" ]
 case "${{1:-}}" in
   --version)
     exit 0
@@ -273,32 +328,9 @@ esac
     return body, log
 
 
-def _seeded_rclone_body(
-    tmp_path: Path,
-    *,
-    copied_seed: Path,
-) -> tuple[str, Path]:
-    log = tmp_path / "rclone-commands.log"
-    config = tmp_path / "persistent" / "secrets" / "rclone.conf"
-    body = f"""
-[ -z "${{TOPODROME_SITE_ENROLLMENT_TOKEN:-}}" ]
-[ -z "${{TOPODROME_SITE_FENCE_VERIFICATION_KEY:-}}" ]
-[ -z "${{TOPODROME_HF_TOKEN:-}}" ]
-[ "$RCLONE_CONFIG" = {shlex.quote(str(config))} ]
-case "${{1:-}}" in
-  version)
-    exit 0
-    ;;
-  copyto)
-    printf '%s\n' "$*" >>{shlex.quote(str(log))}
-    /bin/cp -- {shlex.quote(str(copied_seed))} "$3"
-    ;;
-  *)
-    exit 91
-    ;;
-esac
-"""
-    return body, log
+def _seed_server(tmp_path: Path, *, copied_seed: Path) -> Path:
+    _, log = _http_seed_fixture(tmp_path, copied_seed)
+    return log
 
 
 def test_builder_creates_immutable_secret_free_release(tmp_path: Path) -> None:
@@ -318,14 +350,13 @@ def test_builder_creates_immutable_secret_free_release(tmp_path: Path) -> None:
             "config/site.yaml",
             "config/models.yaml",
             "tools/uv",
-            "tools/rclone",
+            "src/topodrome/deployment/bootstrap_http.py",
             "bundle-manifest.json",
         } <= names
         assert not any(".venv" in name or "__pycache__" in name for name in names)
         site = yaml.safe_load(archive.extractfile("config/site.yaml").read())
         assert site["model_config"] == "config/models.yaml"
-        assert site["rclone"]["binary"] == "rclone"
-        assert site["rclone"]["verification_via_scheduler"] is True
+        assert site["storage"]["authority_id"] == "lab1-global"
         manifest = json.loads(archive.extractfile("bundle-manifest.json").read())
         assert manifest["format_version"] == 2
         assert manifest["site_id"] == "autodl"
@@ -333,14 +364,13 @@ def test_builder_creates_immutable_secret_free_release(tmp_path: Path) -> None:
 
 def test_builder_allows_regional_only_model_loading(tmp_path: Path) -> None:
     models = _model_config()
-    del models["models"]["meta-llama-3-8b-instruct"]["sites"]["autodl"]["local_path"]
+    del models["models"]["meta-llama/Meta-Llama-3-8B-Instruct"]["sites"]["autodl"]["local_path"]
     artifacts = build_autodl_bootstrap(
         repository_root=Path(__file__).resolve().parents[2],
         site_config=_write_yaml(tmp_path / "site.yaml", _site_config()),
         model_config=_write_yaml(tmp_path / "models.yaml", models),
         output_dir=tmp_path / "output",
         uv_binary=_tool(tmp_path / "uv"),
-        rclone_binary=_tool(tmp_path / "rclone"),
     )
     assert artifacts.release_archive.is_file()
 
@@ -352,7 +382,6 @@ def test_builder_rejects_credentials_and_non_ephemeral_runtime_paths(tmp_path: P
     site = _write_yaml(tmp_path / "site.yaml", site_value)
     models = _write_yaml(tmp_path / "models.yaml", _model_config())
     uv = _tool(tmp_path / "uv")
-    rclone = _tool(tmp_path / "rclone")
 
     with pytest.raises(ValueError, match="embeds a credential"):
         build_autodl_bootstrap(
@@ -361,7 +390,6 @@ def test_builder_rejects_credentials_and_non_ephemeral_runtime_paths(tmp_path: P
             model_config=models,
             output_dir=tmp_path / "output",
             uv_binary=uv,
-            rclone_binary=rclone,
         )
 
     site_value.pop("enrollment_token")
@@ -374,41 +402,38 @@ def test_builder_rejects_credentials_and_non_ephemeral_runtime_paths(tmp_path: P
             model_config=models,
             output_dir=tmp_path / "output",
             uv_binary=uv,
-            rclone_binary=rclone,
         )
 
 
-def test_builder_requires_known_rclone_mode_and_ephemeral_mirror(
-    tmp_path: Path,
-) -> None:
+def test_builder_requires_http_mirror_on_ephemeral_disk(tmp_path: Path) -> None:
     repository = Path(__file__).resolve().parents[2]
     site_value = _site_config()
-    site_value["rclone"]["mode"] = "unknown"
-    site = _write_yaml(tmp_path / "site.yaml", site_value)
     models = _write_yaml(tmp_path / "models.yaml", _model_config())
     uv = _tool(tmp_path / "uv")
-    rclone = _tool(tmp_path / "rclone")
-
-    with pytest.raises(ValueError, match="rclone mode must be mount or mirror"):
+    for value, message in (
+        (None, "requires an HTTP storage mirror"),
+        ({"bulk_url": "http://external.example"}, "must use HTTPS"),
+    ):
+        site_value["storage"] = value
+        site = _write_yaml(tmp_path / "site.yaml", site_value)
+        with pytest.raises(ValueError, match=message):
+            build_autodl_bootstrap(
+                repository_root=repository,
+                site_config=site,
+                model_config=models,
+                output_dir=tmp_path / "output",
+                uv_binary=uv,
+            )
+    site_value = _site_config()
+    site_value["global_root"] = "/root/autodl-fs/cache"
+    site = _write_yaml(tmp_path / "site.yaml", site_value)
+    with pytest.raises(ValueError, match="HTTP mirror global_root must be below"):
         build_autodl_bootstrap(
             repository_root=repository,
             site_config=site,
             model_config=models,
             output_dir=tmp_path / "output",
             uv_binary=uv,
-            rclone_binary=rclone,
-        )
-
-    site_value["rclone"]["mode"] = "mirror"
-    _write_yaml(site, site_value)
-    with pytest.raises(ValueError, match="mirror global_root must be below"):
-        build_autodl_bootstrap(
-            repository_root=repository,
-            site_config=site,
-            model_config=models,
-            output_dir=tmp_path / "output",
-            uv_binary=uv,
-            rclone_binary=rclone,
         )
 
 
@@ -417,7 +442,6 @@ def test_beijing_b_autodl_example_builds_as_mirrored_tunneled_release(
 ) -> None:
     repository = Path(__file__).resolve().parents[2]
     uv = _tool(tmp_path / "uv")
-    rclone = _tool(tmp_path / "rclone")
 
     artifacts = build_autodl_bootstrap(
         repository_root=repository,
@@ -425,7 +449,6 @@ def test_beijing_b_autodl_example_builds_as_mirrored_tunneled_release(
         model_config=repository / "configs/models.example.yaml",
         output_dir=tmp_path / "output",
         uv_binary=uv,
-        rclone_binary=rclone,
     )
 
     with tarfile.open(artifacts.release_archive, "r:gz") as archive:
@@ -433,8 +456,8 @@ def test_beijing_b_autodl_example_builds_as_mirrored_tunneled_release(
         assert stream is not None
         site = yaml.safe_load(stream.read())
     assert site["scheduler_url"] == "http://127.0.0.1:18042"
-    assert site["rclone"]["mode"] == "mirror"
-    assert site["rclone"]["remote"] == "lab1-global:"
+    assert site["storage"]["bulk_url"] == "http://127.0.0.1:18043"
+    assert site["bulk_ssh_local_forward"]["local_port"] == 18043
     assert site["global_root"].startswith("/root/autodl-tmp/")
     assert site["ssh_local_forward"]["local_port"] == 18042
     assert site["ssh_local_forward"]["target_port"] == 8042
@@ -449,7 +472,6 @@ def test_builder_requires_matching_ssh_route_for_loopback_scheduler(
     site = _write_yaml(tmp_path / "site.yaml", site_value)
     models = _write_yaml(tmp_path / "models.yaml", _model_config())
     uv = _tool(tmp_path / "uv")
-    rclone = _tool(tmp_path / "rclone")
     repository = Path(__file__).resolve().parents[2]
 
     with pytest.raises(ValueError, match="requires ssh_local_forward"):
@@ -459,7 +481,6 @@ def test_builder_requires_matching_ssh_route_for_loopback_scheduler(
             model_config=models,
             output_dir=tmp_path / "output",
             uv_binary=uv,
-            rclone_binary=rclone,
         )
 
     site_value["ssh_local_forward"] = {
@@ -476,17 +497,22 @@ def test_builder_requires_matching_ssh_route_for_loopback_scheduler(
         "ssh_executable": "/usr/bin/ssh",
     }
     _write_yaml(site, site_value)
-    with pytest.raises(ValueError, match="must match scheduler_url exactly"):
+    with pytest.raises(ValueError, match="configured SSH local-forward"):
         build_autodl_bootstrap(
             repository_root=repository,
             site_config=site,
             model_config=models,
             output_dir=tmp_path / "output",
             uv_binary=uv,
-            rclone_binary=rclone,
         )
 
     site_value["ssh_local_forward"]["local_port"] = 18042
+    site_value["storage"]["bulk_url"] = "http://127.0.0.1:18043"
+    site_value["bulk_ssh_local_forward"] = {
+        **site_value["ssh_local_forward"],
+        "local_port": 18043,
+        "state_directory": "/root/autodl-tmp/topodrome/bulk-tunnel",
+    }
     _write_yaml(site, site_value)
     artifacts = build_autodl_bootstrap(
         repository_root=repository,
@@ -494,7 +520,6 @@ def test_builder_requires_matching_ssh_route_for_loopback_scheduler(
         model_config=models,
         output_dir=tmp_path / "output",
         uv_binary=uv,
-        rclone_binary=rclone,
     )
     assert artifacts.release_archive.is_file()
 
@@ -549,7 +574,6 @@ set -eu
   printf 'cwd=%s\n' "$PWD"
   printf 'venv=%s\n' "$UV_PROJECT_ENVIRONMENT"
   printf 'cache=%s\n' "$UV_CACHE_DIR"
-  printf 'rclone=%s\n' "$RCLONE_CONFIG"
   printf 'ray=%s\n' "$(command -v ray)"
   printf 'args=%s\n' "$*"
   printf 'provider=%s\n' "$TOPODROME_SITE_PROVIDER_INSTANCE_ID"
@@ -560,7 +584,6 @@ chmod 700 "$UV_PROJECT_ENVIRONMENT/bin/topodrome-agent"
 """
     artifacts = _build(tmp_path, uv_body=uv_body)
     environment, persistent, ephemeral, result_path = _bootstrap_environment(tmp_path, artifacts)
-    rclone_config = persistent / "secrets" / "rclone.conf"
     interpreter_marker = tmp_path / "configured-bootstrap-python-used"
     bootstrap_python = tmp_path / "platform-python"
     bootstrap_python.write_text(
@@ -587,7 +610,6 @@ chmod 700 "$UV_PROJECT_ENVIRONMENT/bin/topodrome-agent"
     assert Path(values["cwd"]).is_relative_to(ephemeral)
     assert Path(values["venv"]).is_relative_to(ephemeral)
     assert Path(values["cache"]).is_relative_to(ephemeral)
-    assert values["rclone"] == str(rclone_config)
     assert Path(values["ray"]) == Path(values["venv"]) / "bin" / "ray"
     assert values["args"].startswith("--config ")
     assert values["provider"] == "pro-bootstrap-test"
@@ -649,11 +671,10 @@ def test_incompatible_target_seed_requires_explicit_online_repair(tmp_path: Path
 def test_preflighted_seed_repair_uses_uv_online_only_with_opt_in(tmp_path: Path) -> None:
     seed = _runtime_seed(tmp_path / "runtime-site-packages.tar.gz")
     uv_body, uv_log = _seeded_uv_body(tmp_path, seed_check_status=42)
-    rclone_body, _rclone_log = _seeded_rclone_body(tmp_path, copied_seed=seed)
+    _seed_server(tmp_path, copied_seed=seed)
     artifacts = _build(
         tmp_path,
         uv_body=uv_body,
-        rclone_body=rclone_body,
         runtime_seed=seed,
         allow_online_fallback=True,
     )
@@ -684,11 +705,10 @@ def test_preflighted_seed_repair_uses_uv_online_only_with_opt_in(tmp_path: Path)
 def test_bootstrap_rejects_wrong_seed_abi_before_downloading_seed(tmp_path: Path) -> None:
     seed = _runtime_seed(tmp_path / "runtime-site-packages.tar.gz")
     uv_body, _uv_log = _seeded_uv_body(tmp_path, seed_check_status=42)
-    rclone_body, rclone_log = _seeded_rclone_body(tmp_path, copied_seed=seed)
+    http_log = _seed_server(tmp_path, copied_seed=seed)
     artifacts = _build(
         tmp_path,
         uv_body=uv_body,
-        rclone_body=rclone_body,
         runtime_seed=seed,
         runtime_seed_platform="x86_64-manylinux_2_99",
         allow_online_fallback=True,
@@ -706,7 +726,7 @@ def test_bootstrap_rejects_wrong_seed_abi_before_downloading_seed(tmp_path: Path
 
     assert completed.returncode != 0
     assert "target platform does not match this worker" in completed.stderr
-    assert not rclone_log.exists()
+    assert not http_log.exists()
 
 
 def test_legacy_seed_release_can_only_reuse_an_existing_uv_environment(
@@ -714,11 +734,10 @@ def test_legacy_seed_release_can_only_reuse_an_existing_uv_environment(
 ) -> None:
     seed = _runtime_seed(tmp_path / "runtime-site-packages.tar.gz")
     uv_body, uv_log = _seeded_uv_body(tmp_path)
-    rclone_body, rclone_log = _seeded_rclone_body(tmp_path, copied_seed=seed)
+    http_log = _seed_server(tmp_path, copied_seed=seed)
     artifacts = _build(
         tmp_path,
         uv_body=uv_body,
-        rclone_body=rclone_body,
         runtime_seed=seed,
     )
     with tarfile.open(artifacts.release_archive, "r:gz") as archive:
@@ -744,7 +763,7 @@ def test_legacy_seed_release_can_only_reuse_an_existing_uv_environment(
     )
     assert first.returncode != 0
     assert "legacy runtime seed may only reuse" in first.stderr
-    assert not rclone_log.exists()
+    assert not http_log.exists()
 
     release = ephemeral / "releases" / legacy_digest
     runtime = release / ".venv"
@@ -777,17 +796,16 @@ def test_legacy_seed_release_can_only_reuse_an_existing_uv_environment(
     assert second.returncode == 0, second.stderr
     assert result.read_text() == "seeded=1\n"
     assert "--offline" in uv_log.read_text()
-    assert not rclone_log.exists()
+    assert not http_log.exists()
 
 
 def test_seeded_bootstrap_fetches_from_lab1_and_reconciles_offline(tmp_path: Path) -> None:
     seed = _runtime_seed(tmp_path / "runtime-site-packages.tar.gz")
     uv_body, uv_log = _seeded_uv_body(tmp_path)
-    rclone_body, rclone_log = _seeded_rclone_body(tmp_path, copied_seed=seed)
+    http_log = _seed_server(tmp_path, copied_seed=seed)
     artifacts = _build(
         tmp_path,
         uv_body=uv_body,
-        rclone_body=rclone_body,
         runtime_seed=seed,
     )
     environment, _persistent, ephemeral, result = _bootstrap_environment(tmp_path, artifacts)
@@ -807,8 +825,8 @@ def test_seeded_bootstrap_fetches_from_lab1_and_reconciles_offline(tmp_path: Pat
     assert len(sync_commands) == 1
     assert sync_commands[0].startswith("sync --frozen --no-dev --extra agent --extra runtime")
     assert "--offline" in sync_commands[0]
-    copy_command = rclone_log.read_text().strip()
-    assert copy_command.startswith(f"copyto {artifacts.runtime_seed_remote} ")
+    copy_command = http_log.read_text().strip()
+    assert copy_command == "GET HTTP seed range 0"
     release = ephemeral / "releases" / artifacts.digest
     assert tuple(release.glob(".venv/lib/python*/site-packages/seeded.py"))
     assert not tuple(ephemeral.glob("tmp/runtime-seed.*.tar.gz"))
@@ -821,7 +839,7 @@ def test_seeded_bootstrap_fetches_from_lab1_and_reconciles_offline(tmp_path: Pat
     assert cached.read_bytes() == seed.read_bytes()
     # Simulate a newly allocated instance with empty local disk, same region.
     environment["TOPODROME_AUTODL_EPHEMERAL_ROOT"] = str(tmp_path / "replacement")
-    before = rclone_log.read_text()
+    before = http_log.read_text()
     replacement = subprocess.run(  # noqa: S603 - generated repository-owned executable
         [str(artifacts.bootstrap_script)],
         env=environment,
@@ -831,7 +849,7 @@ def test_seeded_bootstrap_fetches_from_lab1_and_reconciles_offline(tmp_path: Pat
         timeout=30,
     )
     assert replacement.returncode == 0, replacement.stderr
-    assert rclone_log.read_text() == before
+    assert http_log.read_text() == before
 
 
 def test_seed_hash_mismatch_never_falls_back_to_network(tmp_path: Path) -> None:
@@ -841,11 +859,10 @@ def test_seed_hash_mismatch_never_falls_back_to_network(tmp_path: Path) -> None:
     body[-1] ^= 1
     corrupted.write_bytes(body)
     uv_body, uv_log = _seeded_uv_body(tmp_path)
-    rclone_body, _ = _seeded_rclone_body(tmp_path, copied_seed=corrupted)
+    _seed_server(tmp_path, copied_seed=corrupted)
     artifacts = _build(
         tmp_path,
         uv_body=uv_body,
-        rclone_body=rclone_body,
         runtime_seed=seed,
         allow_online_fallback=True,
     )
@@ -868,11 +885,10 @@ def test_seed_hash_mismatch_never_falls_back_to_network(tmp_path: Path) -> None:
 def test_release_lock_mismatch_fails_before_seed_fetch_or_sync(tmp_path: Path) -> None:
     seed = _runtime_seed(tmp_path / "runtime-site-packages.tar.gz")
     uv_body, uv_log = _seeded_uv_body(tmp_path)
-    rclone_body, rclone_log = _seeded_rclone_body(tmp_path, copied_seed=seed)
+    http_log = _seed_server(tmp_path, copied_seed=seed)
     artifacts = _build(
         tmp_path,
         uv_body=uv_body,
-        rclone_body=rclone_body,
         runtime_seed=seed,
         allow_online_fallback=True,
     )
@@ -891,23 +907,16 @@ def test_release_lock_mismatch_fails_before_seed_fetch_or_sync(tmp_path: Path) -
     assert completed.returncode != 0
     assert "release manifest does not match uv.lock" in completed.stderr
     assert not uv_log.exists()
-    assert not rclone_log.exists()
+    assert not http_log.exists()
 
 
 def test_seed_fetch_uses_network_only_with_explicit_fallback(tmp_path: Path) -> None:
     seed = _runtime_seed(tmp_path / "runtime-site-packages.tar.gz")
     uv_body, uv_log = _seeded_uv_body(tmp_path)
-    rclone_body = r"""
-case "${1:-}" in
-  version) exit 0 ;;
-  copyto) exit 42 ;;
-  *) exit 91 ;;
-esac
-"""
+    _http_seed_fixture(tmp_path)  # Unavailable authority: online repair is explicitly opted in.
     artifacts = _build(
         tmp_path,
         uv_body=uv_body,
-        rclone_body=rclone_body,
         runtime_seed=seed,
         allow_online_fallback=True,
     )
@@ -949,11 +958,10 @@ def test_concurrent_bootstraps_publish_one_valid_release_and_runtime(
     seed = _runtime_seed(tmp_path / "runtime-site-packages.tar.gz")
     agent_exit_gate = tmp_path / "allow-agent-exit"
     uv_body, uv_log = _seeded_uv_body(tmp_path, agent_wait_file=agent_exit_gate)
-    rclone_body, rclone_log = _seeded_rclone_body(tmp_path, copied_seed=seed)
+    http_log = _seed_server(tmp_path, copied_seed=seed)
     artifacts = _build(
         tmp_path,
         uv_body=uv_body,
-        rclone_body=rclone_body,
         runtime_seed=seed,
     )
     environment, _persistent, ephemeral, result = _bootstrap_environment(tmp_path, artifacts)
@@ -998,7 +1006,7 @@ def test_concurrent_bootstraps_publish_one_valid_release_and_runtime(
 
     assert result.read_text() == "seeded=1\n"
     assert len(uv_log.read_text().splitlines()) == 1
-    assert len(rclone_log.read_text().splitlines()) == 1
+    assert len(http_log.read_text().splitlines()) == 1
     releases = ephemeral / "releases"
     release = releases / artifacts.digest
     assert (release / ".bundle-ready").read_text().strip() == artifacts.digest
@@ -1029,7 +1037,6 @@ def test_builder_rejects_unsafe_seed_and_credential_bearing_configuration(
     _write_yaml(tmp_path / "site.yaml", site)
     models = _write_yaml(tmp_path / "models.yaml", _model_config())
     uv = _tool(tmp_path / "uv")
-    rclone = _tool(tmp_path / "rclone")
     repository = Path(__file__).resolve().parents[2]
     with pytest.raises(ValueError, match="embeds a credential"):
         build_autodl_bootstrap(
@@ -1038,30 +1045,27 @@ def test_builder_rejects_unsafe_seed_and_credential_bearing_configuration(
             model_config=models,
             output_dir=tmp_path / "output",
             uv_binary=uv,
-            rclone_binary=rclone,
         )
 
     site.pop("fence_verification_key")
-    site["rclone"]["remote"] = ":sftp,host=lab1,user=root,pass=hidden:topodrome"
+    site["storage"]["bulk_url"] = "https://user:hidden@scheduler.lab1.example"
     _write_yaml(tmp_path / "site.yaml", site)
-    with pytest.raises(ValueError, match="credential-free named rclone reference"):
+    with pytest.raises(ValueError, match="credential-free HTTP"):
         build_autodl_bootstrap(
             repository_root=repository,
             site_config=tmp_path / "site.yaml",
             model_config=models,
             output_dir=tmp_path / "output",
             uv_binary=uv,
-            rclone_binary=rclone,
         )
 
 
-def test_builder_accepts_remote_root_and_places_seed_below_it(tmp_path: Path) -> None:
+def test_builder_places_seed_in_authoritative_bootstrap_namespace(tmp_path: Path) -> None:
     site_value = _site_config()
-    site_value["rclone"]["remote"] = "lab1-global:"
+    site_value["storage"]["authority_id"] = "lab1-global"
     site = _write_yaml(tmp_path / "site-root.yaml", site_value)
     models = _write_yaml(tmp_path / "models-root.yaml", _model_config())
     uv = _tool(tmp_path / "uv-root")
-    rclone = _tool(tmp_path / "rclone-root")
     seed = _runtime_seed(tmp_path / "runtime-root.tar.gz")
 
     artifacts = build_autodl_bootstrap(
@@ -1070,12 +1074,11 @@ def test_builder_accepts_remote_root_and_places_seed_below_it(tmp_path: Path) ->
         model_config=models,
         output_dir=tmp_path / "output-root",
         uv_binary=uv,
-        rclone_binary=rclone,
         runtime_seed=seed,
     )
 
     assert artifacts.runtime_seed_remote is not None
-    assert artifacts.runtime_seed_remote.startswith("lab1-global:bootstrap/runtime-seeds/")
+    assert artifacts.runtime_seed_remote.startswith("bootstrap/runtime-seeds/")
 
 
 def test_builder_rejects_credential_bearing_model_origin_and_repository_text(
@@ -1084,12 +1087,11 @@ def test_builder_rejects_credential_bearing_model_origin_and_repository_text(
     repository = Path(__file__).resolve().parents[2]
     site = _write_yaml(tmp_path / "site.yaml", _site_config())
     model_value = _model_config()
-    model_value["models"]["meta-llama-3-8b-instruct"]["sites"]["autodl"]["origin"] = (
+    model_value["models"]["meta-llama/Meta-Llama-3-8B-Instruct"]["sites"]["autodl"]["origin"] = (
         "https://user:password@hf-mirror.com/model"
     )
     models = _write_yaml(tmp_path / "models.yaml", model_value)
     uv = _tool(tmp_path / "uv")
-    rclone = _tool(tmp_path / "rclone")
     with pytest.raises(ValueError, match="credential-free Hugging Face repository"):
         build_autodl_bootstrap(
             repository_root=repository,
@@ -1097,11 +1099,10 @@ def test_builder_rejects_credential_bearing_model_origin_and_repository_text(
             model_config=models,
             output_dir=tmp_path / "output",
             uv_binary=uv,
-            rclone_binary=rclone,
         )
 
     model_value = _model_config()
-    model_value["models"]["meta-llama-3-8b-instruct"]["sites"]["autodl"]["endpoint"] = (
+    model_value["models"]["meta-llama/Meta-Llama-3-8B-Instruct"]["sites"]["autodl"]["endpoint"] = (
         "https://hf-mirror.com/unapproved-proxy"
     )
     _write_yaml(models, model_value)
@@ -1112,7 +1113,6 @@ def test_builder_rejects_credential_bearing_model_origin_and_repository_text(
             model_config=models,
             output_dir=tmp_path / "output",
             uv_binary=uv,
-            rclone_binary=rclone,
         )
 
     copied_repository = tmp_path / "repository"
@@ -1133,7 +1133,6 @@ def test_builder_rejects_credential_bearing_model_origin_and_repository_text(
             model_config=models,
             output_dir=tmp_path / "output",
             uv_binary=uv,
-            rclone_binary=rclone,
         )
 
 

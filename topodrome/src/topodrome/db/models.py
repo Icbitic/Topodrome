@@ -257,8 +257,9 @@ class ModelCapabilityRow(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     site_id: Mapped[str] = mapped_column(ForeignKey("sites.id", ondelete="CASCADE"), index=True)
-    alias: Mapped[str] = mapped_column(String(200), index=True)
+    repo_id: Mapped[str] = mapped_column(String(200), index=True)
     revision: Mapped[str] = mapped_column(String(200))
+    subfolder: Mapped[str] = mapped_column(String(500), default="", server_default="")
     backend: Mapped[str] = mapped_column(String(100))
     backend_version: Mapped[str] = mapped_column(String(100))
     dtype: Mapped[str] = mapped_column(String(50))
@@ -279,8 +280,9 @@ class ModelCapabilityRow(Base):
     __table_args__ = (
         UniqueConstraint(
             "site_id",
-            "alias",
+            "repo_id",
             "revision",
+            "subfolder",
             "backend",
             "backend_version",
             "dtype",

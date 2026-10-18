@@ -59,6 +59,7 @@ class SiteState(StrEnum):
     STARTING = "starting"
     ERROR = "error"
     OFFLINE = "offline"
+    RETIRED = "retired"
 
 
 class SiteKind(StrEnum):

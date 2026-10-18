@@ -33,6 +33,9 @@ class _CountingStorage:
         self.resolve_calls += 1
         return self.storage.resolve(logical_path)
 
+    def resolve_writable(self, logical_path: str) -> Path:
+        return self.storage.resolve_writable(logical_path)
+
     def flush_and_verify(
         self,
         logical_path: str,

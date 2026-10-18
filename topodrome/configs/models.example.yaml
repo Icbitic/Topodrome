@@ -1,6 +1,7 @@
 models:
-  meta-llama-3-70b-instruct:
+  meta-llama/Meta-Llama-3-70B-Instruct:
     revision: 50fd307e57011801c7833c87efa1984ddf2db42f
+    refs: [main]
     backend: transformers
     backend_version: configured
     dtype: bfloat16
@@ -14,8 +15,9 @@ models:
   # Parallelism is deliberately a per-job setting, not a catalog default.
   # See examples/model_summary_sharded.yaml for one reusable Transformers
   # replica spread across an ordered, atomically leased two-GPU gang.
-  meta-llama-3-8b-instruct:
+  meta-llama/Meta-Llama-3-8B-Instruct:
     revision: 8afb486c1db24fe5011ec46dfbe5b5dccdb575c2
+    refs: [main]
     backend: transformers
     backend_version: 4.57.6
     dtype: bfloat16
@@ -40,8 +42,9 @@ models:
         exclude:
           - original/*
 
-  gemma-3-12b-it:
+  google/gemma-3-12b-it:
     revision: 96b6f1eccf38110c56df3a15bffe176da04bfd80
+    refs: [main]
     backend: transformers
     backend_version: 4.57.6
     dtype: bfloat16
@@ -57,8 +60,9 @@ models:
         local_files_only: true
         estimated_startup_seconds: 180
 
-  olmo-2-1124-7b-instruct:
+  allenai/OLMo-2-1124-7B-Instruct:
     revision: 470b1fba1ae01581f270116362ee4aa1b97f4c84
+    refs: [main]
     backend: transformers
     backend_version: 4.57.6
     dtype: bfloat16
@@ -74,8 +78,9 @@ models:
         local_files_only: true
         estimated_startup_seconds: 110
 
-  qwen3-4b-instruct-2507:
+  Qwen/Qwen3-4B-Instruct-2507:
     revision: cdbee75f17c01a7cc42f958dc650907174af0554
+    refs: [main]
     backend: transformers
     backend_version: 4.57.6
     dtype: bfloat16

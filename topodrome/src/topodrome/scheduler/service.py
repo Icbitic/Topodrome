@@ -17,6 +17,7 @@ from topodrome.config import ModelCatalog, SchedulerSettings
 from topodrome.db.models import (
     ArtifactRow,
     AttemptRow,
+    GPUReservationRow,
     JobArrayRow,
     JobRow,
     KernelSessionRow,
@@ -29,12 +30,14 @@ from topodrome.db.repositories import SchedulerRepository
 from topodrome.db.session import CURRENT_SCHEMA_REVISION, Database
 from topodrome.domain.enums import (
     AttemptState,
+    GPUReservationState,
     JobState,
     KernelState,
     LeaseState,
     ProviderInstanceState,
     ProviderOperationState,
     SiteKind,
+    SiteState,
     WorkloadKind,
 )
 from topodrome.domain.errors import (
@@ -47,6 +50,7 @@ from topodrome.domain.errors import (
 )
 from topodrome.domain.events import AgentEnvelope, SchedulerEnvelope
 from topodrome.domain.logs import LiveLogChunkReport
+from topodrome.domain.scheduling import SitePreferenceRequest
 from topodrome.domain.specs import (
     AssetMember,
     AssetRef,
@@ -244,6 +248,9 @@ class SchedulerService:
         from .process_telemetry import ProcessTelemetry
 
         self.process_telemetry = ProcessTelemetry()
+        from .system_metrics import SystemMetrics
+
+        self.system_metrics = SystemMetrics(self)
         self.repository = repository or SchedulerRepository()
         self.model_catalog = model_catalog
         self.provider_controller = provider_controller
@@ -269,6 +276,13 @@ class SchedulerService:
         # mutations are counted separately so reload staging remains prompt
         # while promotion still waits for an old-generation mutation to end.
         self._dispatch_reload_lock = asyncio.Lock()
+        from .upgrades import UpgradeController
+
+        self.upgrades = UpgradeController(self)
+        if self.provider_controller is not None and hasattr(
+            self.provider_controller, "maintenance_excluded"
+        ):
+            self.provider_controller.maintenance_excluded = self.upgrades.store.blocked
         self._storage_reference_lock = asyncio.Lock()
         self._policy_drain_blocker_count: int | None = (
             None if self._pending_policy_snapshot is not None else 0
@@ -399,6 +413,7 @@ class SchedulerService:
         visibility: AssetVisibility | None = None,
         limit: int = 100,
         tags: tuple[str, ...] = (),
+        all_versions: bool = False,
     ) -> list[AssetSummary]:
         return await asyncio.to_thread(
             self.assets.list_visible,
@@ -406,6 +421,7 @@ class SchedulerService:
             visibility=visibility,
             limit=limit,
             tags=tags,
+            all_versions=all_versions,
         )
 
     @serialized_storage
@@ -500,6 +516,51 @@ class SchedulerService:
                     f"asset input {alias!r} is invalid or unavailable"
                 ) from exc
         return spec.model_copy(update={"assets": pinned})
+
+    @serialized_storage
+    async def create_download(self, reference, *, owner_username, is_admin=False):
+        from topodrome.storage.download_pins import DownloadPins
+
+        try:
+            if reference.startswith("job://"):
+                manifest = await self._validated_commit_manifest(
+                    job_id_from_ref(reference),
+                    owner_username=None if is_admin else owner_username,
+                )
+                resolved = resolve_job_asset(reference, manifest)
+            elif reference.startswith("asset://"):
+                resolved = await finish_io(
+                    self.assets.resolve,
+                    reference,
+                    requester_username=owner_username,
+                )
+            else:
+                raise ValueError("use a job:// or asset:// reference")
+        except NotFoundError:
+            raise NotFoundError("download reference does not exist") from None
+        except ValueError as exc:
+            raise AdmissionRejectedError("invalid download reference") from exc
+        await finish_io(require_members, self.settings.global_root, resolved.members)
+        return await finish_io(
+            DownloadPins(self.settings.global_root).create, resolved, owner_username
+        )
+
+    @serialized_storage
+    async def renew_download(self, identity, *, owner_username):
+        from topodrome.storage.download_pins import DownloadPins
+
+        return await finish_io(
+            DownloadPins(self.settings.global_root).get,
+            identity,
+            owner_username,
+            renew=True,
+        )
+
+    @serialized_storage
+    async def close_download(self, identity, *, owner_username):
+        from topodrome.storage.download_pins import DownloadPins
+
+        await finish_io(DownloadPins(self.settings.global_root).delete, identity, owner_username)
 
     async def _validated_commit_manifest(
         self,
@@ -737,6 +798,9 @@ class SchedulerService:
         # that may create an OFFERED lease. Therefore promotion cannot observe
         # an empty barrier and then be followed by a late old-policy offer.
         async with self._dispatch_reload_lock:
+            upgrade_all, upgrade_sites = self.upgrades.store.exclusions()
+            if upgrade_all:
+                return False
             if self._pending_policy_snapshot is not None:
                 await self._promote_pending_policy_if_drained()
                 if self._pending_policy_snapshot is not None:
@@ -753,6 +817,7 @@ class SchedulerService:
                     for site in sites
                     if identities.get(site.site_id)
                     == (site.agent_session_id, site.agent_connection_generation)
+                    and site.site_id not in upgrade_sites
                 ]
                 heartbeat_cutoff = utc_now() - timedelta(
                     seconds=self.settings.heartbeat_ttl_seconds
@@ -808,6 +873,7 @@ class SchedulerService:
                             else {}
                         )
                         placement_options = dict(
+                            preferred_site_ids=policy.settings.preferred_site_ids,
                             heartbeat_cutoff=heartbeat_cutoff,
                             fast_gpu_name_patterns=policy.settings.fast_gpu_name_patterns,
                             foreign_capacity_sharing_site_ids=(
@@ -816,7 +882,13 @@ class SchedulerService:
                             startup_seconds_by_site=startup_estimates(
                                 spec,
                                 sites,
-                                policy.startup_seconds(spec.model.alias),
+                                policy.startup_seconds(
+                                    spec.model.repo_id,
+                                    spec.model.revision,
+                                    spec.model.subfolder,
+                                )
+                                if spec.model is not None
+                                else {},
                                 observations,
                             ),
                             queue_delay_seconds_per_job=(
@@ -959,6 +1031,12 @@ class SchedulerService:
                             lease_ttl=timedelta(seconds=self.settings.lease_ttl_seconds),
                             replace_idle_actors=(placement.idle_actor_replacement_gpu_count > 0),
                         )
+                        if job.array_id is not None:
+                            from .arrays import next_array_model
+
+                            offer = offer.model_copy(
+                                update={"next_model": await next_array_model(session, job)}
+                            )
                         break
                     last = jobs[-1]
                     cursor = queue_cursor(last, dispatch_now, policy.settings.starvation_seconds)
@@ -983,6 +1061,26 @@ class SchedulerService:
                     site_id=offer.site_id,
                     attempt_id=offer.attempt_id,
                 )
+                # A send may have reached the worker before raising. Keep its
+                # offer fenced until acceptance or expiry; never reassign an
+                # ambiguously delivered GPU gang.
+            else:
+                if not delivered:
+                    # The registry returns False only before calling send:
+                    # there is no socket or its generation changed. Nothing
+                    # reached the worker, so waiting the full offer TTL is
+                    # unnecessary. Requeue under durable state locks instead.
+                    async with self.database.transaction() as session:
+                        withdrawn = await self.repository.withdraw_undelivered_offer(
+                            session, attempt_id=offer.attempt_id, site_id=offer.site_id
+                        )
+                    if withdrawn:
+                        self._live_tokens.pop(offer.attempt_id, None)
+                        log.info(
+                            "assignment_undelivered_requeued",
+                            site_id=offer.site_id,
+                            attempt_id=offer.attempt_id,
+                        )
         return delivered
 
     def scheduling_policy_snapshot(self) -> SchedulingPolicySnapshot:
@@ -1028,60 +1126,87 @@ class SchedulerService:
                     "scheduling policy reload failed validation; prior policy retained"
                 ) from None
 
-            pending = self._pending_policy_snapshot
-            if pending is not None:
-                if same_policy_content(candidate, pending):
-                    self._policy_drain_blocker_count = await self._policy_drain_blockers()
-                    return self._policy_status_payload()
-                raise ConflictError("a different scheduling policy generation is already draining")
-            if same_policy_content(candidate, active):
-                return self._policy_status_payload()
+            return await self._stage_policy_candidate(candidate)
 
-            assert self._policy_store is not None
-            staged = SchedulingPolicyState(active=active, pending=candidate)
-            save_error, was_cancelled = await _finish_policy_save(
-                self._policy_store,
-                staged,
-            )
-            if save_error is None or isinstance(save_error, PolicyStateCommitUncertainError):
-                # Mirror the visible rename before any cancellation can leave
-                # the lock. This is the fail-closed half of the disk+memory
-                # staging protocol.
-                self._pending_policy_snapshot = candidate
-                self._policy_drain_blocker_count = None
-            if was_cancelled:
-                raise asyncio.CancelledError
-            if isinstance(save_error, PolicyStateCommitUncertainError):
-                # os.replace already made the staged state visible. Fail
-                # closed in memory too, so old-policy dispatch cannot resume
-                # merely because the directory fsync result was ambiguous.
-                self._policy_drain_blocker_count = await self._policy_drain_blockers()
-                log.error(
-                    "scheduling_policy_stage_commit_uncertain",
-                    generation=candidate.generation,
+    async def set_site_preference(self, request: SitePreferenceRequest) -> dict[str, object]:
+        """Persist a future-placement order without changing any existing lease."""
+        if self._policy_store is None:
+            raise ConflictError("scheduler has no durable scheduling policy store")
+        async with self._dispatch_reload_lock:
+            active = self._policy_snapshot
+            if request.expected_generation != active.generation:
+                raise ConflictError("scheduling policy changed; refresh before editing")
+            async with self.database.session() as session:
+                known = set(
+                    await session.scalars(
+                        select(SiteRow.id).where(SiteRow.state != SiteState.RETIRED)
+                    )
                 )
-                raise DurabilityError(
-                    "scheduling policy was staged but final durability is uncertain; "
-                    "dispatch is paused"
-                ) from None
-            if save_error is not None:
-                log.error(
-                    "scheduling_policy_stage_failed",
-                    generation=candidate.generation,
-                    error_type=type(save_error).__name__,
+            if set(request.preferred_site_ids) - known:
+                raise AdmissionRejectedError(
+                    "preferred sites must be registered, non-retired sites"
                 )
-                raise DurabilityError(
-                    "scheduling policy reload could not be staged durably"
-                ) from None
-            self._policy_drain_blocker_count = await self._policy_drain_blockers()
-            log.info(
-                "scheduling_policy_reload_staged",
-                active_generation=active.generation,
-                pending_generation=candidate.generation,
-                blocker_count=self._policy_drain_blocker_count,
-                loaded_at=candidate.loaded_at.isoformat(),
+            candidate = SchedulingPolicySnapshot(
+                settings=active.settings.model_copy(
+                    update={"preferred_site_ids": request.preferred_site_ids},
+                    deep=True,
+                ),
+                startup_seconds_by_model=active.startup_seconds_by_model,
+                generation=active.generation + 1,
+                loaded_at=utc_now(),
             )
+            await self._stage_policy_candidate(candidate)
+            if self._pending_policy_snapshot is not None:
+                if not await self._promote_pending_policy_if_drained():
+                    raise DurabilityError("site preference activation is pending; refresh status")
             return self._policy_status_payload()
+
+    async def _stage_policy_candidate(
+        self,
+        candidate: SchedulingPolicySnapshot,
+    ) -> dict[str, object]:
+        """Caller holds the dispatch/reload lock through the durable stage."""
+        active = self._policy_snapshot
+        pending = self._pending_policy_snapshot
+        if pending is not None:
+            if same_policy_content(candidate, pending):
+                self._policy_drain_blocker_count = await self._policy_drain_blockers()
+                return self._policy_status_payload()
+            raise ConflictError("a different scheduling policy generation is already draining")
+        if same_policy_content(candidate, active):
+            return self._policy_status_payload()
+
+        assert self._policy_store is not None
+        staged = SchedulingPolicyState(active=active, pending=candidate)
+        save_error, was_cancelled = await _finish_policy_save(self._policy_store, staged)
+        if save_error is None or isinstance(save_error, PolicyStateCommitUncertainError):
+            # Mirror the visible rename before cancellation releases the lock.
+            self._pending_policy_snapshot = candidate
+            self._policy_drain_blocker_count = None
+        if was_cancelled:
+            raise asyncio.CancelledError
+        if isinstance(save_error, PolicyStateCommitUncertainError):
+            self._policy_drain_blocker_count = await self._policy_drain_blockers()
+            log.error("scheduling_policy_stage_commit_uncertain", generation=candidate.generation)
+            raise DurabilityError(
+                "scheduling policy was staged but final durability is uncertain; dispatch is paused"
+            ) from None
+        if save_error is not None:
+            log.error(
+                "scheduling_policy_stage_failed",
+                generation=candidate.generation,
+                error_type=type(save_error).__name__,
+            )
+            raise DurabilityError("scheduling policy reload could not be staged durably") from None
+        self._policy_drain_blocker_count = await self._policy_drain_blockers()
+        log.info(
+            "scheduling_policy_reload_staged",
+            active_generation=active.generation,
+            pending_generation=candidate.generation,
+            blocker_count=self._policy_drain_blocker_count,
+            loaded_at=candidate.loaded_at.isoformat(),
+        )
+        return self._policy_status_payload()
 
     async def _promote_pending_policy_if_drained(self) -> bool:
         """Promote a staged generation; caller holds the dispatch/reload lock."""
@@ -1186,6 +1311,10 @@ class SchedulerService:
         return {
             "status": "draining" if pending is not None else "active",
             "generation": active.generation,
+            "preferred_site_ids": active.settings.preferred_site_ids,
+            "pending_preferred_site_ids": (
+                pending.settings.preferred_site_ids if pending is not None else None
+            ),
             "loaded_at": active.loaded_at,
             "pending_generation": pending.generation if pending is not None else None,
             "pending_loaded_at": pending.loaded_at if pending is not None else None,
@@ -1217,6 +1346,7 @@ class SchedulerService:
         stale_live_log = False
         terminal_log_registration: tuple[str, str, AttemptLogDescriptor | None] | None = None
         process_sample = None
+        idle_compute_permission = None
         async with self.database.transaction() as session:
             # Notebook results use the live control lane.  They are correlated
             # by the durable request digest below, but their code/output must
@@ -1346,6 +1476,24 @@ class SchedulerService:
                 )
                 if accepted:
                     process_sample = (heartbeat, event_receipt.acknowledged_at)
+                    if heartbeat.idle_compute_requested:
+                        blocked = await session.scalars(
+                            select(GPUReservationRow.gpu_uuid).where(
+                                GPUReservationRow.site_id == heartbeat.site_id,
+                                GPUReservationRow.state.in_(
+                                    [
+                                        GPUReservationState.PENDING,
+                                        GPUReservationState.READY,
+                                    ]
+                                ),
+                                GPUReservationRow.expires_at > utc_now(),
+                            )
+                        )
+                        idle_compute_permission = {
+                            "allowed": heartbeat.state.value == "ready",
+                            "blocked_gpu_uuids": sorted(set(blocked)),
+                            "valid_for_seconds": 15,
+                        }
             elif envelope.kind == "assignment_accepted":
                 attempt = await self.repository.accept_offer(
                     session,
@@ -1566,7 +1714,9 @@ class SchedulerService:
         if process_sample is not None:
             heartbeat, received_at = process_sample
             self.process_telemetry.record(
-                heartbeat, generation=connection_generation, received_at=received_at,
+                heartbeat,
+                generation=connection_generation,
+                received_at=received_at,
             )
         if live_log_report is not None:
             try:
@@ -1658,6 +1808,11 @@ class SchedulerService:
             kind="ack",
             payload={
                 "message_id": envelope.message_id,
+                **(
+                    {"idle_compute_permission": idle_compute_permission}
+                    if idle_compute_permission is not None
+                    else {}
+                ),
                 **({"terminal_log_pending": True} if terminal_log_pending else {}),
                 **(
                     {"finalization_recovery_required": True}
@@ -1706,6 +1861,15 @@ class SchedulerService:
         *,
         owner_username: str = "@operator",
     ) -> KernelSummary:
+        async with self._dispatch_reload_lock:
+            return await self._create_kernel(request, owner_username=owner_username)
+
+    async def _create_kernel(
+        self,
+        request: KernelRequest,
+        *,
+        owner_username: str = "@operator",
+    ) -> KernelSummary:
         session_id = new_id("kernel")
         relay_id = new_id("relay")
         builtin = await asyncio.to_thread(self.sources.ensure_builtin_kernel)
@@ -1747,6 +1911,7 @@ class SchedulerService:
                     if (
                         site is None
                         or identity is None
+                        or self.upgrades.store.blocked(str(host.site_id))
                         or identity != (site.agent_session_id, site.agent_connection_generation)
                     ):
                         host = None
@@ -2258,6 +2423,7 @@ class SchedulerService:
                     site
                     for site in await self.repository.placement_inventory(session)
                     if site.kind in {SiteKind.LAB, SiteKind.JUPYTER}
+                    and not self.upgrades.store.blocked(site.site_id)
                     and site.heartbeat_at >= heartbeat_cutoff
                     and identities.get(site.site_id)
                     == (site.agent_session_id, site.agent_connection_generation)
@@ -2421,7 +2587,17 @@ class SchedulerService:
                     )
                     await self.provider_controller.reconcile_once()
                 if self.jupyter_bootstrap_controller is not None:
-                    await self.jupyter_bootstrap_controller.reconcile_once()
+                    # Bootstrap task admission must share the idle-claim fence:
+                    # a pre-check outside this lock could launch an agent after
+                    # the updater had already claimed an idle site.
+                    async with self._dispatch_reload_lock:
+                        site_id = getattr(
+                            getattr(self.jupyter_bootstrap_controller, "settings", None),
+                            "site_id",
+                            "",
+                        )
+                        if not self.upgrades.store.blocked(site_id):
+                            await self.jupyter_bootstrap_controller.reconcile_once()
                 if loop_time >= next_live_log_prune:
                     next_live_log_prune = loop_time + min(
                         3600.0,
@@ -2599,12 +2775,20 @@ class SchedulerService:
         return hashlib.sha256(_canonical_json(operation_payload)).digest()
 
     def _resolve_model(self, spec: JobSpec) -> JobSpec:
-        if self.model_catalog is None:
+        if self.model_catalog is None or spec.model is None:
             return spec
-        definition = self.model_catalog.resolve(spec.model.alias)
+        try:
+            definition = self.model_catalog.resolve(
+                spec.model.repo_id,
+                revision=spec.model.revision,
+                subfolder=spec.model.subfolder,
+            )
+        except ValueError as exc:
+            raise AdmissionRejectedError(str(exc)) from None
         model = spec.model.model_copy(
             update={
                 "revision": definition.revision,
+                "subfolder": definition.subfolder,
                 "backend": definition.backend,
                 "backend_version": definition.backend_version,
                 "dtype": definition.dtype,

@@ -55,6 +55,88 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 GIB = 1024**3
 
 
+@pytest.mark.postgres
+@pytest.mark.parametrize("operation", ["offer", "reservation"])
+async def test_heartbeat_and_inventory_claim_do_not_deadlock(
+    migrated_postgres_dsn: str, operation: str,
+) -> None:
+    """Reproduce the actual parent-site/GPU-child lock cycle on isolated PG."""
+    database = Database(migrated_postgres_dsn)
+    repository = SchedulerRepository()
+    site_id = "heartbeat-claim-" + operation
+    sample = _heartbeat().model_copy(update={"site_id": site_id})
+    job_id = None
+    task = None
+    worker_started = asyncio.Event()
+    worker_pid = None
+
+    async def claim():
+        nonlocal worker_pid
+        async with database.transaction() as session:
+            worker_pid = await session.scalar(text("SELECT pg_backend_pid()"))
+            worker_started.set()
+            if operation == "reservation":
+                row = await repository.create_gpu_reservation(
+                    session, GPUReservationRequest(
+                        site_id=site_id, gpu_uuid="gpu-0", duration_seconds=600,
+                        reason="isolated PostgreSQL lock-order regression",
+                    ),
+                )
+                return row.id
+            job = await repository.get_job(session, job_id, lock=True)
+            await repository.claim_locked_job(session, job)
+            offer = await repository.create_offer(
+                session, job=job, site_id=site_id, gpu_uuids=("gpu-0",),
+                authority=FencingAuthority(b"postgres-lock-order-test-key-32b"),
+                offer_ttl=timedelta(seconds=180),
+            )
+            return offer.attempt_id
+
+    async def wait_for_parent_lock(parent_pid):
+        # No timing guess: wait until PG proves the claim is blocked by the
+        # heartbeat. On the broken implementation it has already locked GPUs
+        # and is waiting for its site foreign-key check instead.
+        async with database.session() as observer:
+            while True:
+                blockers = await observer.scalar(
+                    text("SELECT pg_blocking_pids(:pid)"), {"pid": worker_pid},
+                )
+                if parent_pid in blockers:
+                    return
+                await asyncio.sleep(0.01)
+
+    try:
+        async with database.transaction() as session:
+            await repository.upsert_heartbeat(session, sample)
+            job = await repository.submit_job(session, _job_spec(priority=0))
+            job_id = job.id
+        async with database.transaction() as session:
+            parent_pid = await session.scalar(text("SELECT pg_backend_pid()"))
+            await session.get(SiteRow, site_id, with_for_update=True)
+            task = asyncio.create_task(claim())
+            await asyncio.wait_for(worker_started.wait(), timeout=10)
+            await asyncio.wait_for(wait_for_parent_lock(parent_pid), timeout=10)
+            # This used to deadlock while deleting GPUs. It must now complete
+            # and commit before the blocked claim obtains site/GPU locks.
+            assert await asyncio.wait_for(repository.upsert_heartbeat(
+                session, sample.model_copy(update={"sequence": 2}),
+            ), timeout=10)
+        assert await asyncio.wait_for(task, timeout=10)
+    finally:
+        if task is not None:
+            if not task.done():
+                task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        async with database.transaction() as session:
+            if job_id is not None:
+                await session.execute(delete(JobRow).where(JobRow.id == job_id))
+            await session.execute(delete(GPUReservationRow).where(
+                GPUReservationRow.site_id == site_id,
+            ))
+            await session.execute(delete(SiteRow).where(SiteRow.id == site_id))
+        await database.close()
+
+
 def _asyncpg_dsn(uri: str) -> str:
     if not uri.startswith("postgresql://"):
         raise ValueError(f"unexpected pgserver URI: {uri}")
@@ -101,7 +183,7 @@ def migrated_postgres_dsn(tmp_path_factory: pytest.TempPathFactory) -> Iterator[
 def _job_spec(*, priority: int) -> JobSpec:
     return JobSpec(
         entrypoint="experiment.py",
-        model={"alias": "model", "revision": "rev"},
+        model={"repo_id": "test/model", "revision": "rev"},
         resources={"gpu": 1, "min_vram_gb": 15},
         priority=priority,
     )
@@ -125,7 +207,7 @@ def _heartbeat() -> SiteHeartbeat:
         ),
         models=(
             ModelCapability(
-                alias="model",
+                repo_id="test/model",
                 revision="rev",
                 backend="transformers",
                 backend_version="configured",
@@ -259,7 +341,7 @@ def test_database_cleanup_guards_and_round_trip_on_postgres(tmp_path: Path) -> N
             "SELECT id, job_id, state, access_generation FROM kernel_sessions",
         )
         before = asyncio.run(sql(*queries))
-        _upgrade(dsn)
+        _upgrade(dsn, "0019_remove_db_legacies")
         assert asyncio.run(sql(*queries)) == before
         _run_alembic(dsn, "downgrade", "0018_job_arrays")
         assert asyncio.run(sql(

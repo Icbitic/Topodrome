@@ -19,6 +19,8 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any
 
+from topodrome.domain.model_address import validate_subfolder
+
 
 class ModelPayloadVerificationError(RuntimeError):
     """The configured model directory is incomplete or has the wrong identity."""
@@ -144,6 +146,7 @@ def verify_transformers_payload(
     revision: str,
     verify_lfs_sha256: bool = False,
     revision_manifest: Path | str | None = None,
+    subfolder: str | None = None,
 ) -> VerifiedModelPayload:
     """Verify completeness and, for commit revisions, Hub revision identity.
 
@@ -154,7 +157,9 @@ def verify_transformers_payload(
     protected independently from the model tree it attests.
     """
 
-    root = Path(path).expanduser().resolve()
+    repository_root = Path(path).expanduser().resolve()
+    subfolder = validate_subfolder(subfolder)
+    root = repository_root if subfolder is None else _resolve_member(repository_root, subfolder)
     if not root.is_dir():
         raise ModelPayloadVerificationError("model directory is unavailable")
     _read_json_object(root / "config.json", "model config")
@@ -199,11 +204,15 @@ def verify_transformers_payload(
     external_manifest = revision_manifest is not None
     if _EXACT_REVISION.fullmatch(revision):
         tree = _read_revision_manifest(
-            root,
+            repository_root,
             revision=revision,
             external_path=revision_manifest,
         )
-        tree_files = tree["files"]
+        prefix = "" if subfolder is None else f"{subfolder}/"
+        tree_files = {
+            name.removeprefix(prefix): entry for name, entry in tree["files"].items()
+            if name.startswith(prefix)
+        }
         for name, observed_size in sizes.items():
             entry = tree_files.get(name)
             if not isinstance(entry, dict) or int(entry.get("size", -1)) != observed_size:
@@ -256,6 +265,8 @@ def verify_transformers_payload(
         "revision": revision,
         "files": identity_files,
     }
+    if subfolder is not None:
+        identity["subfolder"] = subfolder
     digest = hashlib.sha256(
         json.dumps(identity, sort_keys=True, separators=(",", ":")).encode("utf-8")
     ).hexdigest()

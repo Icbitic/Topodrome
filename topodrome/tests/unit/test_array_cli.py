@@ -18,7 +18,7 @@ def test_sync_array_sdk_and_safe_manifest(tmp_path):
     manifest.write_text("""source_dir: src
 job:
   entrypoint: experiment.py
-  model: model
+  model: test/model
 indices: 0-2
 max_parallel: 2
 """)
@@ -68,7 +68,7 @@ def test_array_cli_records_replay_key_and_exits_nonzero_on_failure(tmp_path, mon
     manifest = tmp_path / "array.yaml"
     manifest.write_text("""job:
   entrypoint: experiment.py
-  model: model
+  model: test/model
   source_ref: sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 indices: 0-1
 max_parallel: 1

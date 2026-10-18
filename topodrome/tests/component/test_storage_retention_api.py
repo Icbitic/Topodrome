@@ -32,7 +32,7 @@ async def setup(database, tmp_path):
     for name in ("keep.bin", "expire.bin"):
         path = root / store.committed_prefix / name
         os.utime(path, (old.timestamp(), old.timestamp()))
-    spec = JobSpec(entrypoint="run.py", model="test-model")
+    spec = JobSpec(entrypoint="run.py", model="test/test-model")
     async with database.transaction() as session:
         session.add(
             JobRow(
@@ -105,7 +105,7 @@ async def test_gc_preserves_published_asset_and_rejects_expired_input(database, 
                 "/api/v1/jobs",
                 json={
                     "entrypoint": "run.py",
-                    "model": "test-model",
+                    "model": "test/test-model",
                     "source_ref": source,
                     "assets": {"data": reference},
                 },
@@ -115,7 +115,7 @@ async def test_gc_preserves_published_asset_and_rejects_expired_input(database, 
             "/api/v1/jobs",
             json={
                 "entrypoint": "run.py",
-                "model": "test-model",
+                "model": "test/test-model",
                 "source_ref": source,
                 "assets": {"data": "job://job-one/expire.bin"},
             },
@@ -143,7 +143,7 @@ async def test_queued_consumer_protects_expired_artifact(database, tmp_path):
             "/api/v1/jobs",
             json={
                 "entrypoint": "run.py",
-                "model": "test-model",
+                "model": "test/test-model",
                 "source_ref": source,
                 "assets": {"data": "job://job-one/expire.bin"},
             },
@@ -213,6 +213,36 @@ async def test_storage_gc_requires_operator(database, tmp_path):
             "/api/v1/access/users/alice", headers={"Authorization": "Bearer test-operator"}
         )
         token = granted.json()["token"]
+        response = await c.get("/api/v1/system", headers={"Authorization": f"Bearer {token}"})
+        assert response.status_code == 403
+        assert app.state.service.system_metrics.task is None
         for url in ("/api/v1/storage/gc", "/api/v1/storage/gc?apply=true"):
             response = await c.post(url, headers={"Authorization": f"Bearer {token}"})
             assert response.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_system_metrics_is_cached_non_mutating_and_no_store(database, tmp_path):
+    from topodrome.client.async_client import AsyncClient
+
+    app, root, _ = await setup(database, tmp_path)
+    before = {p.relative_to(root): p.read_bytes() for p in root.rglob("*") if p.is_file()}
+    metrics = app.state.service.system_metrics
+    try:
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://test"
+        ) as c:
+            response = await c.get("/api/v1/system")
+            assert response.status_code == 200
+            assert response.headers["Cache-Control"] == "no-store"
+            await metrics.task
+        async with AsyncClient("http://test", transport=httpx.ASGITransport(app=app)) as client:
+            report = await client.system_metrics()
+            assert report["storage_state"] == "ready"
+            assert report["storage"]["eligible_24h_bytes"] > 0
+            assert report["retention"]["enabled"] is False
+            assert report["scheduler_rss_bytes"] > 0
+        after = {p.relative_to(root): p.read_bytes() for p in root.rglob("*") if p.is_file()}
+        assert after == before
+    finally:
+        await metrics.close()

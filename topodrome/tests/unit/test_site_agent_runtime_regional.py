@@ -25,7 +25,7 @@ def _assignment(
 ) -> Assignment:
     raw_spec: dict[str, object] = {
         "entrypoint": "experiment.py",
-        "model": {"alias": "model", "revision": "rev"},
+        "model": {"repo_id": "test/model", "revision": "rev"},
         "portability": portability,
     }
     if portability == "region-affine":

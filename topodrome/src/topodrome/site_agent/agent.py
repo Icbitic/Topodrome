@@ -34,6 +34,7 @@ from .admission import (
     LeaseRequest,
 )
 from .cooperative import CooperativeExitVerifier
+from .idle_compute import IdleComputeManager
 from .inventory import (
     GPUSnapshot,
     HostInventoryProvider,
@@ -78,6 +79,7 @@ class Assignment:
     raw_spec: Mapping[str, Any] = field(default_factory=dict)
     gpu_indices: Mapping[str, int] = field(default_factory=dict)
     checkpoint_ref: str | None = None
+    next_model: Mapping[str, Any] | None = None
     fencing_token: str | None = field(default=None, repr=False, compare=False)
 
     @classmethod
@@ -100,7 +102,7 @@ class Assignment:
         if len(gpu_uuids) != job_spec.resources.gpu_count:
             raise ValueError("assignment GPU claim count must equal the job's requested GPU count")
 
-        model = job_spec.model.model_dump(mode="json")
+        model = job_spec.model.model_dump(mode="json") if job_spec.model is not None else None
         canonical_model_key = json.dumps(
             {
                 "model": model,
@@ -145,7 +147,8 @@ class Assignment:
             model_key=model_key,
             renewal_ttl_seconds=float(payload.get("lease_ttl_seconds", 90)),
             allow_actor_reuse=(
-                job_spec.model.parallelism.mode in {"single", "model_sharded"}
+                job_spec.model is not None
+                and job_spec.execution_mode in {"single", "model_sharded"}
                 and job_spec.workload_kind.value != "adapter_training"
                 and not (
                     job_spec.workload_kind.value == "interactive"
@@ -164,6 +167,11 @@ class Assignment:
             raw_spec=spec,
             checkpoint_ref=(
                 None if payload.get("checkpoint_ref") is None else str(payload["checkpoint_ref"])
+            ),
+            next_model=(
+                dict(payload["next_model"])
+                if isinstance(payload.get("next_model"), Mapping)
+                else None
             ),
             fencing_token=fencing_token,
         )
@@ -348,6 +356,7 @@ class SiteAgent:
         process_ownership: ProcessOwnershipRegistry | None = None,
         cooperative_exit: CooperativeExitVerifier | None = None,
         sentinel_factory: CudaSentinelFactory | None = None,
+        idle_compute: IdleComputeManager | None = None,
         site_kind: str = "lab",
         provider_instance_id: str | None = None,
         region: str | None = None,
@@ -384,6 +393,7 @@ class SiteAgent:
         self.process_ownership = process_ownership
         self.cooperative_exit = cooperative_exit or CooperativeExitVerifier(inventory)
         self.sentinel_factory = sentinel_factory
+        self.idle_compute = idle_compute
         self.site_kind = site_kind
         self.provider_instance_id = provider_instance_id
         self.region = region
@@ -411,18 +421,23 @@ class SiteAgent:
         self._drain_command_nonce: str | None = None
         self._durability_command_nonce: str | None = None
         from .input_staging import InputStager
+
         resolver = getattr(backend, "asset_resolver", None)
         self.input_stager = (
             InputStager(
-                resolver, outbound, source_resolver=getattr(backend, "source_resolver", None),
+                resolver,
+                outbound,
+                source_resolver=getattr(backend, "source_resolver", None),
                 checkpoint_resolver=getattr(backend, "prefetch_checkpoint", None),
             )
-            if resolver is not None else None
+            if resolver is not None
+            else None
         )
         self.finalization_journal = getattr(backend, "finalization_journal", None)
         if self.finalization_journal is not None:
             backend.finalization_authority = self._finalization_authorized
             from .finalization import FinalizationJournal
+
             self.terminal_log_journal = FinalizationJournal(
                 self.finalization_journal.root.parent / "terminal-logs"
             )
@@ -443,6 +458,13 @@ class SiteAgent:
             asyncio.create_task(self._terminal_log_loop(), name="topodrome-terminal-logs"),
             asyncio.create_task(self._cache_loop(), name="topodrome-cache-maintenance"),
         ]
+        if self.idle_compute is not None:
+            tasks.append(
+                asyncio.create_task(
+                    self._idle_compute_loop(),
+                    name="topodrome-idle-compute",
+                )
+            )
         stopped = asyncio.create_task(self._stop.wait(), name="topodrome-stop-waiter")
         try:
             done, _ = await asyncio.wait([*tasks, stopped], return_when=asyncio.FIRST_COMPLETED)
@@ -465,12 +487,27 @@ class SiteAgent:
                 *cancellation_tasks,
                 return_exceptions=True,
             )
+            if self.idle_compute is not None:
+                await self.idle_compute.stop()
             await self.outbound.disconnect()
+
+    async def _idle_compute_loop(self) -> None:
+        assert self.idle_compute is not None
+        while not self._stop.is_set():
+            # Same admission lock prevents a helper from racing a new lease.
+            async with self._active_lock:
+                snapshots = await asyncio.to_thread(self.inventory.sample)
+                await self.idle_compute.tick(snapshots, draining=self._draining)
+            await _wait_or_stop(self._stop, self.idle_compute.settings.poll_interval_seconds)
 
     def _finalization_authorized(self, attempt_id):
         active = self._active.get(attempt_id)
-        return bool(active and not active.scheduler_terminal and not active.cancel_requested
-                    and active.assignment.lease.expires_at > time.time())
+        return bool(
+            active
+            and not active.scheduler_terminal
+            and not active.cancel_requested
+            and active.assignment.lease.expires_at > time.time()
+        )
 
     async def _cache_loop(self):
         policy = self.asset_cache_policy
@@ -486,10 +523,13 @@ class SiteAgent:
                     break
                 try:
                     with cancellable_transfers(stop):
-                        task = asyncio.create_task(asyncio.to_thread(
-                            self.input_stager.resolver.collect,
-                            max_age_seconds=policy["max_age"], max_bytes=policy["max_bytes"],
-                        ))
+                        task = asyncio.create_task(
+                            asyncio.to_thread(
+                                self.input_stager.resolver.collect,
+                                max_age_seconds=policy["max_age"],
+                                max_bytes=policy["max_bytes"],
+                            )
+                        )
                         await asyncio.shield(task)
                 except Exception as exc:
                     log.warning("cache_collection_deferred", error_type=type(exc).__name__)
@@ -504,7 +544,8 @@ class SiteAgent:
             for journal in (
                 getattr(self, "finalization_journal", None),
                 getattr(self, "terminal_log_journal", None),
-            ) if journal is not None
+            )
+            if journal is not None
         )
 
     def _finalization_backlog(self):
@@ -523,7 +564,8 @@ class SiteAgent:
                         if attempt_id in self._active:
                             continue
                         reply = await self.outbound.publish_request(
-                            f"recover-finalization:{attempt_id}", "recover_finalization",
+                            f"recover-finalization:{attempt_id}",
+                            "recover_finalization",
                             {"job_id": receipt["job_id"], "attempt_id": attempt_id},
                         )
                         result = reply["finalization_recovery"]
@@ -557,11 +599,13 @@ class SiteAgent:
                         )
                         # This interface only needs the immutable coordinates.
                         from types import SimpleNamespace
+
                         descriptor = await self.backend.verify_attempt_log(
                             SimpleNamespace(**receipt), workspace
                         )
                         reply = await self.outbound.publish_request(
-                            "terminal-log:" + receipt["attempt_id"], "attempt_log_complete",
+                            "terminal-log:" + receipt["attempt_id"],
+                            "attempt_log_complete",
                             {**receipt, "log": descriptor},
                         )
                         if reply.get("terminal_log_pending"):
@@ -580,29 +624,40 @@ class SiteAgent:
                 self.workspaces.prepare, assignment.job_id, attempt_id
             )
             self._active[attempt_id].workspace = workspace
-            stream = asyncio.create_task(self._stream_attempt_log_safely(
-                attempt_id, workspace.log_dir / "attempt.log", stop
-            ))
+            stream = asyncio.create_task(
+                self._stream_attempt_log_safely(attempt_id, workspace.log_dir / "attempt.log", stop)
+            )
             outcome = await self.backend.resume_finalization(assignment, workspace, receipt)
             await self._publish_attempt_state(
-                assignment, "succeeded", artifacts=tuple(_artifact_payload(outcome.metadata)),
+                assignment,
+                "succeeded",
+                artifacts=tuple(_artifact_payload(outcome.metadata)),
                 checkpoint_ref=_optional_metadata_text(outcome.metadata, "checkpoint_ref"),
-                attempt_log=outcome.metadata.get("log"), log_complete=True,
+                attempt_log=outcome.metadata.get("log"),
+                log_complete=True,
             )
             self.finalization_journal.complete(attempt_id)
             await asyncio.to_thread(self.workspaces.cleanup_scratch, workspace)
         except Exception as exc:
             # Receipt and outputs remain durable locally. Reconciliation retries
             # only this uploader, without preparing or acquiring a model actor.
-            log.warning("recovered_finalization_delayed", attempt_id=attempt_id,
-                        error_type=type(exc).__name__)
+            log.warning(
+                "recovered_finalization_delayed",
+                attempt_id=attempt_id,
+                error_type=type(exc).__name__,
+            )
             active = self._active[attempt_id]
             if active.explicit_cancel_requested and not active.scheduler_terminal:
-                self.terminal_log_journal.save({
-                    "job_id": assignment.job_id, "attempt_id": attempt_id,
-                })
+                self.terminal_log_journal.save(
+                    {
+                        "job_id": assignment.job_id,
+                        "attempt_id": attempt_id,
+                    }
+                )
                 await self._publish_attempt_state(
-                    assignment, "canceled", reason_code="cancel_requested",
+                    assignment,
+                    "canceled",
+                    reason_code="cancel_requested",
                     message="upload canceled; locally staged outputs retained",
                 )
                 self.finalization_journal.complete(attempt_id)
@@ -790,6 +845,9 @@ class SiteAgent:
             if self._stop.is_set():
                 return
             self._draining = True
+            if getattr(self, "idle_compute", None) is not None:
+                async with self._active_lock:
+                    await self.idle_compute.stop()
             if getattr(self, "input_stager", None) is not None:
                 await self.input_stager.close()
             async with self._active_lock:
@@ -1148,23 +1206,61 @@ class SiteAgent:
             if assignment.attempt_id in self._active:
                 # Scheduler command replay is idempotent.
                 return True
-            spec = (JobSpec.model_validate(assignment.raw_spec)
-                    if self.input_stager is not None else None)
+            if self.idle_compute is not None:
+                had_idle_load = bool(
+                    set(assignment.lease.gpu_uuids) & self.idle_compute.workers.keys()
+                )
+                await self.idle_compute.stop(assignment.lease.gpu_uuids)
+                if had_idle_load:
+                    # NVML's utilization window can retain the just-stopped
+                    # filler. Let it settle rather than bypassing admission.
+                    deadline = time.monotonic() + 1.5
+                    while time.monotonic() < deadline:
+                        snapshots = await asyncio.to_thread(self.inventory.sample)
+                        if all(
+                            snapshot.utilization_percent <= 10 or snapshot.processes
+                            for snapshot in snapshots
+                            if snapshot.uuid in assignment.lease.gpu_uuids
+                        ):
+                            break
+                        await asyncio.sleep(0.1)
+            spec = (
+                JobSpec.model_validate(assignment.raw_spec)
+                if self.input_stager is not None
+                else None
+            )
             if (
-                self.input_stager is not None and (spec.assets or spec.source_ref)
+                self.input_stager is not None
+                and (spec.assets or spec.source_ref)
                 and not self.input_stager.ready(assignment.job_id, spec, assignment.checkpoint_ref)
             ):
                 await self._publish_rejection(assignment, "inputs are not staged at this site")
                 return False
-            if (
-                self._finalization_backlog()
-                >= self.finalization_backlog_limit
-            ):
+            if self._finalization_backlog() >= self.finalization_backlog_limit:
                 await self._publish_rejection(assignment, "finalization backlog is full")
                 return False
             if assignment.lease.replace_idle_actors or _requires_slot_eviction(assignment):
                 try:
-                    await self._evict_private_slot_actors(assignment)
+                    switcher = getattr(self.backend, "switchable_runtime", None)
+                    source = None
+                    if callable(switcher) and assignment.lease.replace_idle_actors:
+                        allocations = tuple(
+                            self.fences.actor_allocation(uuid)
+                            for uuid in assignment.lease.gpu_uuids
+                        )
+                        source = await switcher(assignment, allocations)
+                    if source is not None:
+                        assignment = replace(
+                            assignment,
+                            lease=replace(
+                                assignment.lease,
+                                runtime_switch_actor_id=source.actor_id,
+                                runtime_switch_model_key=source.model_key,
+                                runtime_switch_process_ids=source.process_ids,
+                            ),
+                        )
+                    else:
+                        await self._evict_private_slot_actors(assignment)
                 except Exception as exc:
                     await self._publish_rejection(
                         assignment,
@@ -1173,6 +1269,33 @@ class SiteAgent:
                     )
                     return False
             decision = await asyncio.to_thread(self.admission.admit, assignment.lease)
+            if not decision.accepted and assignment.lease.runtime_switch_actor_id is not None:
+                # Optional reuse cannot strand work when NVML cannot account
+                # for the old process's VRAM. No failed admission owns claims;
+                # fall back to exact idle disposal and a fresh physical probe.
+                newer = all(
+                    (highest := self.fences.highest_fence(uuid)) is None
+                    or assignment.lease.fence_epochs[uuid] > highest
+                    for uuid in assignment.lease.gpu_uuids
+                )
+                if newer and assignment.lease.expires_at > time.time():
+                    assignment = replace(
+                        assignment,
+                        lease=replace(
+                            assignment.lease,
+                            runtime_switch_actor_id=None,
+                            runtime_switch_model_key=None,
+                            runtime_switch_process_ids=(),
+                        ),
+                    )
+                    try:
+                        await self._evict_private_slot_actors(assignment)
+                    except Exception as exc:
+                        await self._publish_rejection(
+                            assignment, _safe_message(f"{type(exc).__name__}: {exc}")
+                        )
+                        return False
+                    decision = await asyncio.to_thread(self.admission.admit, assignment.lease)
             if not decision.accepted:
                 await self._publish_rejection(
                     assignment, decision.reason or "physical admission rejected"
@@ -1249,10 +1372,12 @@ class SiteAgent:
             self._active[assignment.attempt_id] = _ActiveAttempt(
                 assignment, task, sentinel=sentinel
             )
-            if self.input_stager is not None:
-                self.input_stager.resolver.pin(
-                    assignment.attempt_id, spec.assets.values()
+            if assignment.lease.runtime_switch_actor_id is not None:
+                self._active[assignment.attempt_id].prepared = self.backend.switch_source(
+                    assignment
                 )
+            if self.input_stager is not None:
+                self.input_stager.resolver.pin(assignment.attempt_id, spec.assets.values())
                 self.input_stager.consumed(assignment.job_id)
         return True
 
@@ -1262,7 +1387,10 @@ class SiteAgent:
     ) -> tuple[str, ...]:
         """Batch-fence exact idle actors, then release every physical member."""
 
-        if _parallelism_mode(assignment) == "model_sharded" and assignment.lease.allow_actor_reuse:
+        if (
+            _parallelism_mode(assignment) in {"single", "model_sharded"}
+            and assignment.lease.allow_actor_reuse
+        ):
             selected_allocations = tuple(
                 await asyncio.gather(
                     *(
@@ -1521,7 +1649,13 @@ class SiteAgent:
             raise
 
     async def _run_attempt(self, assignment: Assignment, sentinel: CudaSentinel | None) -> None:
-        prepared: PreparedRuntime | None = None
+        # Retain the exact old handle for cancellation/failure cleanup while
+        # loading. A partial switch must never orphan an untracked CUDA owner.
+        prepared: PreparedRuntime | None = (
+            self.backend.switch_source(assignment)
+            if assignment.lease.runtime_switch_actor_id is not None
+            else None
+        )
         outcome: ExecutionOutcome | None = None
         workspace: AttemptWorkspace | None = None
         terminal: _PendingTerminalState | None = None
@@ -1548,9 +1682,11 @@ class SiteAgent:
             )
             if callable(getattr(self.outbound, "publish_live_request", None)):
                 self._active[assignment.attempt_id].log_stream_started = True
-                log_stream = asyncio.create_task(self._stream_attempt_log_safely(
-                    assignment.attempt_id, workspace.log_dir / "attempt.log", log_stop
-                ))
+                log_stream = asyncio.create_task(
+                    self._stream_attempt_log_safely(
+                        assignment.attempt_id, workspace.log_dir / "attempt.log", log_stop
+                    )
+                )
             stage_inputs = getattr(self.backend, "stage_inputs", None)
             if callable(stage_inputs):
                 # A canceled await does not stop work already running through
@@ -1604,9 +1740,7 @@ class SiteAgent:
                 if active is not None:
                     active.prepared = prepared
             kernel_mode = _kernel_mode(assignment)
-            if (
-                kernel_mode is KernelMode.RAW_MODEL or _is_adapter_training(assignment)
-            ) and prepared.reused:
+            if _is_private_workload(assignment) and prepared.reused:
                 raise RuntimeError("private workloads require a fresh disposable actor")
             if await self._local_lease_expired(assignment.attempt_id):
                 raise _LocalLeaseExpired("local lease expired before execution")
@@ -1679,8 +1813,16 @@ class SiteAgent:
                 return
             reporter("computing")
             await self._publish_attempt_state(
-                assignment, "running", timings={
-                    "startup_seconds": None if prepared.reused else min(startup_seconds, 86400),
+                assignment,
+                "running",
+                timings={
+                    # A revision switch is timed by the normal starting phase,
+                    # but must not train the cold process/model-start estimator.
+                    "startup_seconds": (
+                        None
+                        if prepared.reused or assignment.lease.runtime_switch_actor_id is not None
+                        else min(startup_seconds, 86400)
+                    ),
                 },
             )
             self._active[assignment.attempt_id].compute_started_at = time.monotonic()
@@ -2024,9 +2166,12 @@ class SiteAgent:
             # Completion of the compute lease must not wait on remote storage.
             # The fsynced log remains local, and this private outbox survives a
             # restart until authoritative verification and its scheduler ACK.
-            self.terminal_log_journal.save({
-                "job_id": assignment.job_id, "attempt_id": assignment.attempt_id,
-            })
+            self.terminal_log_journal.save(
+                {
+                    "job_id": assignment.job_id,
+                    "attempt_id": assignment.attempt_id,
+                }
+            )
             return replace(terminal, log=None, log_complete=False)
         verify = getattr(self.backend, "verify_attempt_log", None)
         delay = _TERMINAL_LOG_VERIFY_INITIAL_RETRY_SECONDS
@@ -2153,9 +2298,15 @@ class SiteAgent:
                         self.process_ownership.unregister(pid)
         active.finalization_started_at = time.monotonic()
         await self._publish_attempt_state(
-            assignment, "committing", gpu_released=True, timings={
-                "compute_seconds": (active.finalization_started_at - active.compute_started_at
-                                    if active.compute_started_at is not None else None),
+            assignment,
+            "committing",
+            gpu_released=True,
+            timings={
+                "compute_seconds": (
+                    active.finalization_started_at - active.compute_started_at
+                    if active.compute_started_at is not None
+                    else None
+                ),
             },
         )
         return True
@@ -2608,10 +2759,16 @@ class SiteAgent:
             if hasattr(active, "transfer_cancel"):
                 active.transfer_cancel.set()
             active.explicit_cancel_requested = True
-            if (getattr(active, "workspace", None) is not None
-                and callable(getattr(self.backend, "verify_attempt_log", None))):
-                phase = ("stopping-upload" if active.gpu_released else
-                         "stopping-worker" if active.prepared is not None else "stopping-download")
+            if getattr(active, "workspace", None) is not None and callable(
+                getattr(self.backend, "verify_attempt_log", None)
+            ):
+                phase = (
+                    "stopping-upload"
+                    if active.gpu_released
+                    else "stopping-worker"
+                    if active.prepared is not None
+                    else "stopping-download"
+                )
                 TransferLogReporter(active.workspace.log_dir / "attempt.log")(phase)
             if hasattr(active, "transfer_cancel"):
                 active.transfer_cancel.set()
@@ -2844,9 +3001,17 @@ class SiteAgent:
                 {
                     "site_id": self.site_id,
                     "site_kind": self.site_kind,
+                    **(
+                        {"idle_compute_requested": True}
+                        if getattr(self, "idle_compute", None) is not None
+                        else {}
+                    ),
                     "state": "draining" if self._draining else "ready",
                     "gpus": [_snapshot_payload(snapshot) for snapshot in snapshots],
                     "models": [dict(value) for value in model_capabilities],
+                    "supports_model_free": bool(
+                        getattr(getattr(self, "backend", None), "supports_model_free", False)
+                    ),
                     "cached_assets": list(self.cached_assets()),
                     "supported_workloads": (
                         []
@@ -2995,10 +3160,12 @@ class SiteAgent:
             raise RuntimeError("active assignment is missing its fencing token")
         if (
             getattr(self, "finalization_journal", None) is not None
-            and active.gpu_released and assignment.lease.expires_at <= time.time()
+            and active.gpu_released
+            and assignment.lease.expires_at <= time.time()
         ):
             reply = await self.outbound.publish_request(
-                f"recover-finalization:{assignment.attempt_id}", "recover_finalization",
+                f"recover-finalization:{assignment.attempt_id}",
+                "recover_finalization",
                 {"job_id": assignment.job_id, "attempt_id": assignment.attempt_id},
             )
             result = reply["finalization_recovery"]
@@ -3028,9 +3195,7 @@ class SiteAgent:
         if ack_payload.get("finalization_recovery_required"):
             # The old event was acknowledged as a no-op. Retry via the separate
             # upload-only recovery lane rather than leaving it at the spool head.
-            active.assignment = replace(
-                assignment, lease=replace(assignment.lease, expires_at=0)
-            )
+            active.assignment = replace(assignment, lease=replace(assignment.lease, expires_at=0))
             return await self._finish_pending_renewal_locked(active, renew_local=False)
         raw_terminal = ack_payload.get("lease_renewal_terminal")
         if raw_terminal is not None:
@@ -3190,17 +3355,20 @@ class SiteAgent:
         interactive = any(
             item.assignment.raw_spec.get("workload_kind") == "interactive" for item in active
         )
-        artifact_pending = any(
-            getattr(item, "gpu_released", False)
-            or (
-                item.prepared is not None
-                and (
-                    bool(item.assignment.raw_spec.get("required_outputs", ()))
-                    or bool(getattr(item, "preempt_requested", False))
+        artifact_pending = (
+            any(
+                getattr(item, "gpu_released", False)
+                or (
+                    item.prepared is not None
+                    and (
+                        bool(item.assignment.raw_spec.get("required_outputs", ()))
+                        or bool(getattr(item, "preempt_requested", False))
+                    )
                 )
+                for item in active
             )
-            for item in active
-        ) or self._pending_io_receipts()
+            or self._pending_io_receipts()
+        )
         # Model/source acquisition is part of prepare. Required outputs remain
         # conservatively pending for the duration of execute; the backend does
         # not return success until their authoritative verification finishes.
@@ -3209,9 +3377,8 @@ class SiteAgent:
             "assignment_queued_locally": queued,
             "interactive_kernel_active": interactive,
             "artifact_flush_pending": artifact_pending,
-            "staging_operation_active": queued or bool(
-                getattr(self, "input_stager", None) and self.input_stager.stages
-            ),
+            "staging_operation_active": queued
+            or bool(getattr(self, "input_stager", None) and self.input_stager.stages),
         }
 
     async def _pressure_loop(self) -> None:
@@ -3552,6 +3719,7 @@ class SiteAgent:
                 timings = {
                     "finalization_seconds": time.monotonic() - active.finalization_started_at,
                 }
+
             async def publish(kind, payload):
                 if getattr(self, "finalization_journal", None) is None:
                     return await self.outbound.publish(kind, payload)
@@ -3559,11 +3727,10 @@ class SiteAgent:
                     f"attempt-state:{current.attempt_id}:{state}", kind, payload
                 )
                 if reply.get("finalization_recovery_required"):
-                    active.assignment = replace(
-                        current, lease=replace(current.lease, expires_at=0)
-                    )
+                    active.assignment = replace(current, lease=replace(current.lease, expires_at=0))
                     active.renewal_pending = True
                     raise RuntimeError("upload state report needs fresh authority")
+
             await publish(
                 "attempt_event",
                 {
@@ -3675,7 +3842,9 @@ def _is_private_workload(assignment: Assignment) -> bool:
     # Multi-GPU worker groups are deliberately private and disposable. A
     # detached single-GPU actor cannot safely be folded into their atomic
     # placement group, so exact idle allocations must be evicted beforehand.
-    if _parallelism_mode(assignment) == "distributed":
+    if (
+        "model" in assignment.raw_spec and assignment.raw_spec["model"] is None
+    ) or _parallelism_mode(assignment) == "distributed":
         return True
     if _is_adapter_training(assignment):
         return True
@@ -3692,7 +3861,7 @@ def _requires_slot_eviction(assignment: Assignment) -> bool:
 def _parallelism_mode(assignment: Assignment) -> str:
     model = assignment.raw_spec.get("model")
     if not isinstance(model, Mapping):
-        return "single"
+        return str(assignment.raw_spec.get("execution") or "single")
     parallelism = model.get("parallelism")
     if not isinstance(parallelism, Mapping):
         return "single"

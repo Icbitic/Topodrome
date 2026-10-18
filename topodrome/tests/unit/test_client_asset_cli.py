@@ -21,8 +21,12 @@ class _AssetClient:
         type(self).published = request
         return {"ref": f"asset://{request.visibility}/{request.name}@{request.version}"}
 
-    def assets(self, *, visibility: str | None, limit: int, tags=()) -> list[dict[str, Any]]:
-        return [{"visibility": visibility, "limit": limit, "tags": tags}]
+    def assets(
+        self, *, visibility: str | None, limit: int, tags=(), all_versions=False
+    ) -> list[dict[str, Any]]:
+        return [
+            {"visibility": visibility, "limit": limit, "tags": tags, "all_versions": all_versions}
+        ]
 
     def delete_asset(self, name, version, *, visibility):
         type(self).published = (name, version, visibility)
@@ -38,6 +42,10 @@ class _AssetClient:
 
     def download_asset(self, name: str, version: str, destination: Path, **values: Any) -> Path:
         type(self).published = {"name": name, "version": version, **values}
+        return destination
+
+    def download(self, reference: str, destination: Path) -> Path:
+        type(self).published = {"reference": reference, "destination": str(destination)}
         return destination
 
     def asset(self, name: str, version: str, *, visibility: str) -> dict[str, Any]:
@@ -80,6 +88,10 @@ def test_asset_list_and_detail_cli(monkeypatch: Any) -> None:
     assert listed.exit_code == 0, listed.output
     assert '"visibility": "private"' in listed.output
     assert '"limit": 4' in listed.output
+    assert '"all_versions": false' in listed.output
+    history = CliRunner().invoke(cli.app, ["assets", "--all-versions"])
+    assert history.exit_code == 0, history.output
+    assert '"all_versions": true' in history.output
     assert detail.exit_code == 0, detail.output
     assert '"visibility": "shared"' in detail.output
 
@@ -100,6 +112,15 @@ def test_asset_download_cli(monkeypatch: Any) -> None:
     result = CliRunner().invoke(cli.app, ["asset-download", "lens", "v1", "./local", "--shared"])
     assert result.exit_code == 0, result.output
     assert _AssetClient.published == {"name": "lens", "version": "v1", "visibility": "shared"}
+
+
+def test_unified_download_cli(monkeypatch: Any) -> None:
+    monkeypatch.setattr(cli, "Client", _AssetClient)
+    for reference in ("job://job-one/results/", "asset://shared/lens@v1"):
+        result = CliRunner().invoke(cli.app, ["download", reference, "./local"])
+        assert result.exit_code == 0, result.output
+        assert _AssetClient.published == {"reference": reference, "destination": "local"}
+        assert '"path": "local"' in result.output
 
 
 def test_asset_delete_confirmation_and_exact_visibility(monkeypatch: Any) -> None:

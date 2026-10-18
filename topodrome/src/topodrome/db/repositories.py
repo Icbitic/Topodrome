@@ -23,6 +23,7 @@ from topodrome.db.models import (
     GPUFenceCounterRow,
     GPUReservationRow,
     GPURow,
+    InputStageRow,
     JobRow,
     JobStateEventRow,
     KernelChannelRequestRow,
@@ -334,10 +335,66 @@ class SchedulerRepository:
             await session.scalars(
                 select(SiteRow)
                 .options(selectinload(SiteRow.gpus), selectinload(SiteRow.models))
+                .where(SiteRow.state != SiteState.RETIRED)
                 .where(or_(SiteRow.kind != SiteKind.AUTODL, SiteRow.state != SiteState.STOPPED))
                 .order_by(SiteRow.id)
             )
         )
+
+    async def retire_site(
+        self,
+        session: AsyncSession,
+        site_id: str,
+        *,
+        now: datetime | None = None,
+        heartbeat_ttl: timedelta = timedelta(seconds=30),
+    ) -> None:
+        """Tombstone quiescent institutional inventory, preserving all history.
+
+        The trusted operator must first revoke enrollment/bootstrap and exclude
+        live connections under the admission fence (or stop the scheduler).
+        This method never stops a process or purges files, attempts or claims.
+        """
+
+        if heartbeat_ttl <= timedelta(0):
+            raise ValueError("heartbeat TTL must be positive")
+        current = _aware(now or utc_now())
+        site = await session.get(SiteRow, site_id, with_for_update=True)
+        if site is None:
+            raise NotFoundError("unknown site")
+        if site.state is SiteState.RETIRED:
+            return
+        if site.kind is SiteKind.AUTODL:
+            raise ConflictError("use the provider registration lifecycle for AutoDL")
+        if site.heartbeat_at is not None and _aware(site.heartbeat_at) >= current - heartbeat_ttl:
+            raise ConflictError("site still has a fresh heartbeat")
+        for model, states in (
+            (AttemptRow, ("offered", "accepted", "starting", "running",
+                          "preempt_requested", "checkpointing", "committing")),
+            (LeaseRow, ("offered", "accepted", "active", "releasing")),
+            (KernelSessionRow, ("requested", "starting", "running", "idle", "stopping")),
+        ):
+            if await session.scalar(
+                select(model.id).where(model.site_id == site_id, model.state.in_(states)).limit(1)
+            ):
+                raise ConflictError("site still has active work or finalization authority")
+        if await session.scalar(
+            select(LeaseGPUClaimRow.lease_id).where(
+                LeaseGPUClaimRow.site_id == site_id, LeaseGPUClaimRow.active.is_(True)
+            ).limit(1)
+        ):
+            raise ConflictError("site still has a physical GPU claim")
+        if await session.scalar(
+            select(InputStageRow.stage_id).where(
+                InputStageRow.site_id == site_id,
+                InputStageRow.state == "downloading",
+                InputStageRow.expires_at > current,
+            ).limit(1)
+        ):
+            raise ConflictError("site still has active input staging")
+        site.state = SiteState.RETIRED
+        site.updated_at = current
+        await session.flush()
 
     async def create_gpu_reservation(
         self,
@@ -387,7 +444,10 @@ class SchedulerRepository:
                 return existing
 
         await self.expire_gpu_reservations(session, now=current)
-        site = await session.get(SiteRow, request.site_id)
+        # Inventory writers lock the site before its GPUs. Otherwise the
+        # reservation's site foreign key can deadlock with a heartbeat that
+        # holds the site and is replacing those same GPU rows.
+        site = await session.get(SiteRow, request.site_id, with_for_update=True)
         if site is None:
             raise NotFoundError(f"site {request.site_id} does not exist")
         gpu_statement = select(GPURow).where(GPURow.site_id == request.site_id)
@@ -1098,6 +1158,8 @@ class SchedulerRepository:
         received_at: datetime | None = None,
     ) -> bool:
         site = await session.get(SiteRow, heartbeat.site_id, with_for_update=True)
+        if site is not None and site.state is SiteState.RETIRED:
+            raise ConflictError("site identity is retired")
         if site is None:
             site = SiteRow(
                 id=heartbeat.site_id,
@@ -1129,6 +1191,9 @@ class SchedulerRepository:
         site.storage_available = heartbeat.storage_available
         site.storage_authoritative = heartbeat.storage_authoritative
         site.supported_workloads = sorted(kind.value for kind in heartbeat.supported_workloads)
+        if heartbeat.supports_model_free:
+            # Capability marker in the existing JSON registry; no schema migration.
+            site.supported_workloads = sorted([*site.supported_workloads, "model_free"])
         site.cached_assets = sorted(heartbeat.cached_assets)
         site.queue_depth = heartbeat.queue_depth
         site.reliability = heartbeat.reliability
@@ -1186,8 +1251,9 @@ class SchedulerRepository:
             session.add(
                 ModelCapabilityRow(
                     site_id=site.id,
-                    alias=model.alias,
+                    repo_id=model.repo_id,
                     revision=model.revision,
+                    subfolder=model.subfolder or "",
                     backend=model.backend,
                     backend_version=model.backend_version,
                     dtype=model.dtype,
@@ -1205,8 +1271,9 @@ class SchedulerRepository:
             if model.availability is ModelAvailability.WARM and model.gpu_uuid:
                 warm_gpu_uuids.add(model.gpu_uuid)
                 key_data: dict[str, object] = {
-                    "alias": model.alias,
+                    "repo_id": model.repo_id,
                     "revision": model.revision,
+                    "subfolder": model.subfolder,
                     "backend": model.backend,
                     "backend_version": model.backend_version,
                     "dtype": model.dtype,
@@ -1265,6 +1332,7 @@ class SchedulerRepository:
         sites = list(
             await session.scalars(
                 select(SiteRow).options(selectinload(SiteRow.gpus), selectinload(SiteRow.models))
+                .where(SiteRow.state != SiteState.RETIRED)
             )
         )
         sites = [site for site in sites if site.id not in releasing_sites]
@@ -1332,8 +1400,9 @@ class SchedulerRepository:
         for site in sites:
             models = tuple(
                 ModelCapability(
-                    alias=model.alias,
+                    repo_id=model.repo_id,
                     revision=model.revision,
+                    subfolder=model.subfolder or None,
                     backend=model.backend,
                     backend_version=model.backend_version,
                     dtype=model.dtype,
@@ -1446,6 +1515,14 @@ class SchedulerRepository:
             raise ConflictError("assignment GPUs must be unique")
         if len(gpu_uuids) != spec.resources.gpu_count:
             raise ConflictError("assignment GPU count does not match the job's requested GPU count")
+        # Match heartbeat/reservation ordering: site, then sorted GPU rows.
+        # Locking GPUs first deadlocks when the attempt's foreign-key insert
+        # waits for a heartbeat holding the site and waiting for those GPUs.
+        site = await session.get(SiteRow, site_id, with_for_update=True)
+        if site is None:
+            raise ConflictError("selected site disappeared from inventory")
+        if site.state is SiteState.RETIRED:
+            raise ConflictError("selected site is retired")
         # Lock the same durable inventory rows used by operator reservation
         # creation.  This closes the stale-placement race across scheduler
         # processes: whichever transaction obtains the physical target first
@@ -1649,6 +1726,60 @@ class SchedulerRepository:
             message=message,
         )
         return attempt
+
+    async def withdraw_undelivered_offer(
+        self,
+        session: AsyncSession,
+        *,
+        attempt_id: str,
+        site_id: str,
+        now: datetime | None = None,
+    ) -> bool:
+        """Retire an offer only when the transport proves it was never sent.
+
+        Send exceptions are ambiguous and must not call this method. An
+        acceptance racing recovery wins; accepted/running work is untouched.
+        """
+        attempt = await self._get_attempt(session, attempt_id, lock=True)
+        if attempt.site_id != site_id:
+            raise StaleFenceError("undelivered offer site identity mismatch")
+        lease = attempt.lease
+        if (
+            attempt.state is not AttemptState.OFFERED
+            or lease is None
+            or lease.state is not LeaseState.OFFERED
+        ):
+            return False
+        job = await self.get_job(session, attempt.job_id, lock=True)
+        if job.state not in {JobState.ASSIGNING, JobState.CANCELING}:
+            return False
+        current = now or utc_now()
+        attempt.state = AttemptState.REJECTED
+        attempt.reason_code = "assignment_undelivered"
+        attempt.completed_at = current
+        lease.state = LeaseState.REJECTED
+        for claim in lease.claims:
+            claim.active = False
+        # The unsent offer never consumed the worker's verified inputs. Reuse
+        # the same still-valid stage instead of imposing the re-stage cooldown.
+        staged = await session.get(InputStageRow, job.id, with_for_update=True)
+        if (
+            not job.cancel_requested
+            and staged is not None
+            and staged.site_id == site_id
+            and staged.state == "consumed"
+            and _aware(staged.expires_at) > _aware(current)
+        ):
+            staged.state = "ready"
+            staged.updated_at = current
+        await self._transition_job(
+            session,
+            job,
+            JobState.CANCELED if job.cancel_requested else JobState.QUEUED,
+            attempt_id=attempt.id,
+            reason_code=attempt.reason_code,
+        )
+        return True
 
     async def renew_lease(
         self,

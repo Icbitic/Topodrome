@@ -15,12 +15,12 @@ GIB = 1024**3
 def capability(
     availability: ModelAvailability = ModelAvailability.CACHED,
     *,
-    alias: str = "meta-llama-3-8b-instruct",
+    repo_id: str = "meta-llama/Meta-Llama-3-8B-Instruct",
     gpu_uuid: str | None = None,
     runtime_fingerprint: str | None = None,
 ) -> ModelCapability:
     return ModelCapability(
-        alias=alias,
+        repo_id=repo_id,
         revision="rev",
         backend="transformers",
         backend_version="4.57.6",
@@ -82,7 +82,7 @@ def spec() -> JobSpec:
     return JobSpec(
         entrypoint="experiment.py",
         model={
-            "alias": "meta-llama-3-8b-instruct",
+            "repo_id": "meta-llama/Meta-Llama-3-8B-Instruct",
             "revision": "rev",
             "backend_version": "4.57.6",
         },
@@ -208,7 +208,7 @@ def test_roomier_shared_jupyter_capacity_beats_crowded_warm_lab_actor() -> None:
     requested = spec()
     runtime_fingerprint = requested.runtime_fingerprint
     actor_key = {
-        "alias": "meta-llama-3-8b-instruct",
+        "repo_id": "meta-llama/Meta-Llama-3-8B-Instruct",
         "revision": "rev",
         "backend": "transformers",
         "backend_version": "4.57.6",
@@ -256,7 +256,7 @@ def test_warm_shared_capacity_remains_eligible_without_roomier_alternative() -> 
     requested = spec()
     runtime_fingerprint = requested.runtime_fingerprint
     actor_key = {
-        "alias": "meta-llama-3-8b-instruct",
+        "repo_id": "meta-llama/Meta-Llama-3-8B-Instruct",
         "revision": "rev",
         "backend": "transformers",
         "backend_version": "4.57.6",
@@ -425,7 +425,7 @@ def test_selected_warm_jupyter_actor_has_zero_cold_start_penalty() -> None:
     requested = spec()
     runtime_fingerprint = requested.runtime_fingerprint
     actor_key = {
-        "alias": "meta-llama-3-8b-instruct",
+        "repo_id": "meta-llama/Meta-Llama-3-8B-Instruct",
         "revision": "rev",
         "backend": "transformers",
         "backend_version": "4.57.6",
@@ -655,7 +655,7 @@ def test_incompatible_paid_capacity_does_not_block_free_lab_fallback() -> None:
                 "autodl",
                 free_gib=32,
                 paid=True,
-                models=(capability(alias="not-the-requested-model"),),
+                models=(capability(repo_id="test/not-the-requested-model"),),
             ),
             site("lab1", free_gib=20),
         ],
@@ -685,7 +685,7 @@ def test_stale_paid_capacity_does_not_preempt_a_fresh_lab_site() -> None:
 def test_warm_compatible_actor_reuses_its_separate_allocation() -> None:
     runtime_fingerprint = spec().runtime_fingerprint
     key = {
-        "alias": "meta-llama-3-8b-instruct",
+        "repo_id": "meta-llama/Meta-Llama-3-8B-Instruct",
         "revision": "rev",
         "backend": "transformers",
         "backend_version": "4.57.6",
@@ -717,7 +717,7 @@ def test_same_site_selector_does_not_hide_warm_actor_behind_emptier_gpu() -> Non
     requested = spec()
     runtime_fingerprint = requested.runtime_fingerprint
     actor_key = {
-        "alias": "meta-llama-3-8b-instruct",
+        "repo_id": "meta-llama/Meta-Llama-3-8B-Instruct",
         "revision": "rev",
         "backend": "transformers",
         "backend_version": "4.57.6",
@@ -766,7 +766,7 @@ def test_warm_site_capability_does_not_zero_startup_for_another_selected_gpu() -
     requested = spec()
     runtime_fingerprint = requested.runtime_fingerprint
     actor_key = {
-        "alias": "meta-llama-3-8b-instruct",
+        "repo_id": "meta-llama/Meta-Llama-3-8B-Instruct",
         "revision": "rev",
         "backend": "transformers",
         "backend_version": "4.57.6",
@@ -814,13 +814,13 @@ def test_warm_site_capability_does_not_zero_startup_for_another_selected_gpu() -
     assert placement.estimated_ready_seconds == 120
 
 
-def test_configured_revision_wildcard_reuses_resolved_warm_actor() -> None:
+def test_unspecified_revision_can_match_capability_before_catalog_resolution() -> None:
     requested = spec().model_copy(
-        update={"model": spec().model.model_copy(update={"revision": "configured"})}
+        update={"model": spec().model.model_copy(update={"revision": None})}
     )
     runtime_fingerprint = requested.runtime_fingerprint
     actor_key = {
-        "alias": "meta-llama-3-8b-instruct",
+        "repo_id": "meta-llama/Meta-Llama-3-8B-Instruct",
         "revision": "resolved-immutable-revision",
         "backend": "transformers",
         "backend_version": "4.57.6",
@@ -834,7 +834,7 @@ def test_configured_revision_wildcard_reuses_resolved_warm_actor() -> None:
         free_gib=2,
         models=(
             ModelCapability(
-                alias="meta-llama-3-8b-instruct",
+                repo_id="meta-llama/Meta-Llama-3-8B-Instruct",
                 revision="resolved-immutable-revision",
                 backend="transformers",
                 backend_version="4.57.6",
@@ -869,7 +869,7 @@ def test_multi_gpu_group_can_replace_idle_single_gpu_actor_but_never_reuses_it()
     requested = JobSpec.model_validate(payload)
     runtime_fingerprint = requested.runtime_fingerprint
     actor_key = {
-        "alias": "meta-llama-3-8b-instruct",
+        "repo_id": "meta-llama/Meta-Llama-3-8B-Instruct",
         "revision": "rev",
         "backend": "transformers",
         "backend_version": "4.57.6",
@@ -915,7 +915,7 @@ def test_multi_gpu_group_can_replace_idle_single_gpu_actor_but_never_reuses_it()
 def test_single_gpu_job_never_reuses_a_member_of_sharded_replica() -> None:
     requested = spec()
     actor_key = {
-        "alias": requested.model.alias,
+        "repo_id": requested.model.repo_id,
         "revision": requested.model.revision,
         "backend": requested.model.backend,
         "backend_version": requested.model.backend_version,
@@ -973,7 +973,7 @@ def test_sharded_job_never_reuses_independent_single_gpu_actors_as_a_replica() -
 
     def single_actor(gpu_uuid: str) -> dict[str, object]:
         return {
-            "alias": requested.model.alias,
+            "repo_id": requested.model.repo_id,
             "revision": requested.model.revision,
             "backend": requested.model.backend,
             "backend_version": requested.model.backend_version,
@@ -1081,7 +1081,7 @@ def test_model_sharded_placement_reuses_only_one_proven_complete_replica() -> No
     requested = JobSpec(
         entrypoint="experiment.py",
         model={
-            "alias": "meta-llama-3-8b-instruct",
+            "repo_id": "meta-llama/Meta-Llama-3-8B-Instruct",
             "revision": "rev",
             "backend_version": "4.57.6",
             "parallelism": {
@@ -1096,7 +1096,7 @@ def test_model_sharded_placement_reuses_only_one_proven_complete_replica() -> No
 
     def actor_key(gpu_uuid: str, replica_id: str = "replica-live") -> dict[str, object]:
         return {
-            "alias": "meta-llama-3-8b-instruct",
+            "repo_id": "meta-llama/Meta-Llama-3-8B-Instruct",
             "revision": "rev",
             "backend": "transformers",
             "backend_version": "4.57.6",
@@ -1137,7 +1137,7 @@ def test_model_sharded_placement_reuses_only_one_proven_complete_replica() -> No
     )
     models = tuple(
         ModelCapability(
-            alias="meta-llama-3-8b-instruct",
+            repo_id="meta-llama/Meta-Llama-3-8B-Instruct",
             revision="rev",
             backend="transformers",
             backend_version="4.57.6",
@@ -1166,7 +1166,7 @@ def test_model_sharded_placement_reuses_only_one_proven_complete_replica() -> No
 
     mismatched = replace(
         candidate,
-        gpus=(gpus[0], replace(gpus[1], actor_key_data=actor_key("GPU-B", "other"))),
+        gpus=(gpus[0], replace(gpus[1], actor_key_data=actor_key("test/GPU-B", "other"))),
     )
     fresh = choose_placement(
         requested,
@@ -1183,7 +1183,7 @@ def test_contended_warm_sharded_replica_does_not_hide_clean_cold_gang() -> None:
     requested = JobSpec(
         entrypoint="experiment.py",
         model={
-            "alias": "meta-llama-3-8b-instruct",
+            "repo_id": "meta-llama/Meta-Llama-3-8B-Instruct",
             "revision": "rev",
             "backend_version": "4.57.6",
             "parallelism": {
@@ -1198,7 +1198,7 @@ def test_contended_warm_sharded_replica_does_not_hide_clean_cold_gang() -> None:
 
     def warm_key(gpu_uuid: str) -> dict[str, object]:
         return {
-            "alias": "meta-llama-3-8b-instruct",
+            "repo_id": "meta-llama/Meta-Llama-3-8B-Instruct",
             "revision": "rev",
             "backend": "transformers",
             "backend_version": "4.57.6",
@@ -1233,7 +1233,7 @@ def test_contended_warm_sharded_replica_does_not_hide_clean_cold_gang() -> None:
     )
     models = tuple(
         ModelCapability(
-            alias="meta-llama-3-8b-instruct",
+            repo_id="meta-llama/Meta-Llama-3-8B-Instruct",
             revision="rev",
             backend="transformers",
             backend_version="4.57.6",
@@ -1282,7 +1282,7 @@ def test_private_workload_can_replace_exact_idle_actor_on_only_gpu(
         {**base.model_dump(mode="python"), "workload_kind": workload_kind, "kwargs": kwargs}
     )
     actor_key = {
-        "alias": "meta-llama-3-8b-instruct",
+        "repo_id": "meta-llama/Meta-Llama-3-8B-Instruct",
         "revision": "rev",
         "backend": "transformers",
         "backend_version": "4.57.6",
@@ -1340,7 +1340,7 @@ def test_placement_filters_reported_available_host_resources() -> None:
 
 def test_incompatible_warm_actor_blocks_gpu_until_eviction() -> None:
     key = {
-        "alias": "another-model",
+        "repo_id": "test/another-model",
         "revision": "rev",
         "backend": "transformers",
         "backend_version": "4.57.6",
@@ -1362,7 +1362,7 @@ def test_incompatible_warm_actor_blocks_gpu_until_eviction() -> None:
 
 def test_queued_ordinary_model_can_replace_complete_idle_actor_before_autodl() -> None:
     key = {
-        "alias": "another-model",
+        "repo_id": "test/another-model",
         "revision": "rev",
         "backend": "transformers",
         "backend_version": "4.57.6",
@@ -1397,7 +1397,7 @@ def test_queued_ordinary_model_can_replace_complete_idle_actor_before_autodl() -
 @pytest.mark.parametrize("blocked", [None, "active_lease", "busy", "reservation"])
 def test_autodl_queue_driven_idle_replacement(blocked) -> None:
     key = {
-        "alias": "another-model",
+        "repo_id": "test/another-model",
         "revision": "rev",
         "backend": "transformers",
         "backend_version": "4.57.6",
@@ -1433,7 +1433,7 @@ def test_autodl_queue_driven_idle_replacement(blocked) -> None:
 
 def test_ordinary_clean_capacity_precedes_idle_actor_replacement() -> None:
     key = {
-        "alias": "another-model",
+        "repo_id": "test/another-model",
         "revision": "rev",
         "backend": "transformers",
         "backend_version": "4.57.6",
@@ -1482,7 +1482,7 @@ def test_replacement_never_selects_only_one_member_of_resident_replica() -> None
             healthy=True,
             actor_key_hash=f"hash-{index}",
             actor_key_data={
-                "alias": "another-model",
+                "repo_id": "test/another-model",
                 "revision": "rev",
                 "backend": "transformers",
                 "backend_version": "4.57.6",
@@ -1515,7 +1515,7 @@ def test_incompatible_runtime_fingerprint_never_reuses_warm_actor() -> None:
     requested = spec()
     incompatible_runtime = "b" * 64
     key = {
-        "alias": "meta-llama-3-8b-instruct",
+        "repo_id": "meta-llama/Meta-Llama-3-8B-Instruct",
         "revision": "rev",
         "backend": "transformers",
         "backend_version": "4.57.6",

@@ -30,7 +30,7 @@ async def test_finalization_lease_survives_gpu_reuse_without_owning_it(database,
         else JobSpec(
             entrypoint="experiment.py",
             model={
-                "alias": "model",
+                "repo_id": "test/model",
                 "revision": "rev",
                 "parallelism": {
                     "mode": "model_sharded",

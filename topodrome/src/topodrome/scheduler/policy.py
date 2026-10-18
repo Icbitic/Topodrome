@@ -15,6 +15,7 @@ from typing import Any
 from uuid import uuid4
 
 from topodrome.config import ModelCatalog, SchedulerSettings, SchedulingPolicySettings
+from topodrome.domain.model_address import model_label
 from topodrome.domain.specs import utc_now
 
 
@@ -27,8 +28,11 @@ class SchedulingPolicySnapshot:
     generation: int
     loaded_at: datetime
 
-    def startup_seconds(self, model_alias: str) -> dict[str, float]:
-        return dict(self.startup_seconds_by_model.get(model_alias, {}))
+    def startup_seconds(
+        self, repo_id: str, revision: str | None = None, subfolder: str | None = None,
+    ) -> dict[str, float]:
+        key = model_label(repo_id, revision, subfolder)
+        return dict(self.startup_seconds_by_model.get(key, {}))
 
     def status(self) -> dict[str, object]:
         return {
@@ -196,8 +200,15 @@ def load_policy_snapshot(
     ):
         raise ValueError("model reload contains a change other than startup estimates")
 
+    candidate_policy = candidate_settings.scheduling.model_copy(deep=True)
+    # An omitted bootstrap setting must not undo a live operator choice when
+    # reloading unrelated settings. An explicitly configured order can replace it.
+    if "preferred_site_ids" not in candidate_policy.model_fields_set:
+        candidate_policy = candidate_policy.model_copy(
+            update={"preferred_site_ids": previous.settings.preferred_site_ids}
+        )
     return SchedulingPolicySnapshot(
-        settings=candidate_settings.scheduling.model_copy(deep=True),
+        settings=candidate_policy,
         startup_seconds_by_model=_startup_estimates(candidate_catalog),
         generation=previous.generation + 1,
         loaded_at=utc_now(),
@@ -220,6 +231,7 @@ def is_live_priority_change(
     """Order changes and stricter future admission cannot invalidate active work."""
 
     fields = {
+        "preferred_site_ids",
         "prefer_autodl_over_foreign_processes",
         "foreign_capacity_sharing_site_ids",
         # Idle-only eviction revalidates every exact replica and lease at the
@@ -240,18 +252,16 @@ def _startup_estimates(
 ) -> Mapping[str, Mapping[str, float]]:
     if model_catalog is None:
         return MappingProxyType({})
-    return MappingProxyType(
-        {
-            alias: MappingProxyType(
-                {
-                    site_id: float(location.estimated_startup_seconds)
-                    for site_id, location in definition.sites.items()
-                    if location.estimated_startup_seconds is not None
-                }
-            )
-            for alias, definition in model_catalog.models.items()
-        }
-    )
+    estimates = {}
+    for definition in model_catalog.variants():
+        estimates[model_label(definition.repo_id, definition.revision, definition.subfolder)] = (
+            MappingProxyType({
+                site_id: float(location.estimated_startup_seconds)
+                for site_id, location in definition.sites.items()
+                if location.estimated_startup_seconds is not None
+            })
+        )
+    return MappingProxyType(estimates)
 
 
 def _catalog_without_startup_estimates(
@@ -261,8 +271,9 @@ def _catalog_without_startup_estimates(
         return None
     payload = model_catalog.model_dump(mode="json")
     for definition in payload["models"].values():
-        for location in definition["sites"].values():
-            location.pop("estimated_startup_seconds", None)
+        for snapshot in (definition, *definition.get("snapshots", ())):
+            for location in snapshot["sites"].values():
+                location.pop("estimated_startup_seconds", None)
     return payload
 
 

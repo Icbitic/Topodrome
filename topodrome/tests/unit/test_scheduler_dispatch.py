@@ -108,7 +108,7 @@ def _heartbeat(
         ),
         models=(
             ModelCapability(
-                alias="model",
+                repo_id="test/model",
                 revision="rev",
                 backend="transformers",
                 backend_version="configured",
@@ -153,7 +153,7 @@ def _burst_heartbeat(
     if warm_gpu_indices:
         models = tuple(
             ModelCapability(
-                alias="model",
+                repo_id="test/model",
                 revision="rev",
                 backend="transformers",
                 backend_version="configured",
@@ -167,7 +167,7 @@ def _burst_heartbeat(
     else:
         models = (
             ModelCapability(
-                alias="model",
+                repo_id="test/model",
                 revision="rev",
                 backend="transformers",
                 backend_version="configured",
@@ -240,7 +240,7 @@ async def test_dispatch_prefers_connected_institutional_capacity_over_paid(
         JobSpec(
             entrypoint="experiment.py",
             source_ref=_source_ref(service),
-            model={"alias": "model", "revision": "rev"},
+            model={"repo_id": "test/model", "revision": "rev"},
             resources={"gpu": 1, "min_vram_gb": 15},
         )
     )
@@ -284,7 +284,7 @@ async def test_cancel_uses_rolling_compatible_bounded_stop_command(
         JobSpec(
             entrypoint="experiment.py",
             source_ref=_source_ref(service),
-            model={"alias": "model", "revision": "rev"},
+            model={"repo_id": "test/model", "revision": "rev"},
             resources={"gpu": 1, "min_vram_gb": 15},
         )
     )
@@ -326,7 +326,7 @@ async def test_burst_spills_from_crowded_warm_lab_slots_to_roomy_jupyter(
     job_spec = JobSpec(
         entrypoint="experiment.py",
         source_ref=_source_ref(service),
-        model={"alias": "model", "revision": "rev"},
+        model={"repo_id": "test/model", "revision": "rev"},
         resources={"gpu": 1, "min_vram_gb": 20},
     )
     for site_id, heartbeat in (
@@ -406,8 +406,8 @@ async def test_dispatch_uses_catalog_site_model_startup_estimates(
     catalog = ModelCatalog.model_validate(
         {
             "models": {
-                "model": {
-                    "alias": "model",
+                "test/model": {
+                    "repo_id": "test/model",
                     "revision": "rev",
                     "sites": {
                         "lab1": {"path": "/models/model", "estimated_startup_seconds": 2},
@@ -435,7 +435,7 @@ async def test_dispatch_uses_catalog_site_model_startup_estimates(
         JobSpec(
             entrypoint="experiment.py",
             source_ref=_source_ref(service),
-            model={"alias": "model", "revision": "rev"},
+            model={"repo_id": "test/model", "revision": "rev"},
             resources={"gpu": 1, "min_vram_gb": 15},
         )
     )
@@ -484,7 +484,7 @@ async def test_local_rejection_quarantines_exact_gpu_until_next_heartbeat(
         JobSpec(
             entrypoint="experiment.py",
             source_ref=_source_ref(service),
-            model={"alias": "model", "revision": "rev"},
+            model={"repo_id": "test/model", "revision": "rev"},
             resources={"gpu": 1, "min_vram_gb": 15},
         )
     )
@@ -531,7 +531,7 @@ async def test_local_rejection_quarantines_exact_gpu_until_next_heartbeat(
         JobSpec(
             entrypoint="experiment.py",
             source_ref=_source_ref(service),
-            model={"alias": "model", "revision": "rev"},
+            model={"repo_id": "test/model", "revision": "rev"},
             resources={"gpu": 1, "min_vram_gb": 15},
         )
     )
@@ -582,7 +582,7 @@ async def test_dispatch_uses_active_autodl_only_when_institutional_capacity_is_i
         JobSpec(
             entrypoint="experiment.py",
             source_ref=_source_ref(service),
-            model={"alias": "model", "revision": "rev"},
+            model={"repo_id": "test/model", "revision": "rev"},
             resources={"gpu": 1, "min_vram_gb": 15},
         )
     )
@@ -638,7 +638,7 @@ async def test_dispatch_foreign_blocker_on_jupyter_cannot_mask_active_autodl(
         JobSpec(
             entrypoint="experiment.py",
             source_ref=_source_ref(service),
-            model={"alias": "model", "revision": "rev"},
+            model={"repo_id": "test/model", "revision": "rev"},
             resources={"gpu": 1, "min_vram_gb": 15},
             workload_kind="interactive",
             kwargs={"mode": "raw-model"},
@@ -690,7 +690,7 @@ async def test_dispatch_lab1_foreign_capacity_sharing_is_explicitly_opted_in(
         JobSpec(
             entrypoint="experiment.py",
             source_ref=_source_ref(service),
-            model={"alias": "model", "revision": "rev"},
+            model={"repo_id": "test/model", "revision": "rev"},
             resources={"gpu": 1, "min_vram_gb": 15},
         )
     )
@@ -741,7 +741,7 @@ async def test_dispatch_applies_configured_fast_gpu_names_before_normal_scoring(
         JobSpec(
             entrypoint="experiment.py",
             source_ref=_source_ref(service),
-            model={"alias": "model", "revision": "rev"},
+            model={"repo_id": "test/model", "revision": "rev"},
             resources={"gpu": 1, "min_vram_gb": 15},
         )
     )
@@ -787,7 +787,7 @@ async def test_unplaced_demand_stays_queued_without_renting(
         JobSpec(
             entrypoint="experiment.py",
             source_ref=_source_ref(service),
-            model={"alias": "model", "revision": "rev"},
+            model={"repo_id": "test/model", "revision": "rev"},
             resources={"gpu": 1, "min_vram_gb": 15},
         )
     )
@@ -819,7 +819,7 @@ async def test_unplaced_job_never_requests_provider_capacity(
         JobSpec(
             entrypoint="experiment.py",
             source_ref=_source_ref(service),
-            model={"alias": "model", "revision": "rev"},
+            model={"repo_id": "test/model", "revision": "rev"},
             resources={"gpu": 1, "min_vram_gb": 15},
         )
     )
@@ -865,7 +865,7 @@ async def test_unplaceable_autodl_job_does_not_starve_institutional_work(
         JobSpec(
             entrypoint="experiment.py",
             source_ref=_source_ref(service),
-            model={"alias": "model", "revision": "rev"},
+            model={"repo_id": "test/model", "revision": "rev"},
             resources={"gpu": 1, "min_vram_gb": 15},
             affinity_site_id="autodl",
             priority=20,
@@ -875,7 +875,7 @@ async def test_unplaceable_autodl_job_does_not_starve_institutional_work(
         JobSpec(
             entrypoint="experiment.py",
             source_ref=_source_ref(service),
-            model={"alias": "model", "revision": "rev"},
+            model={"repo_id": "test/model", "revision": "rev"},
             resources={"gpu": 1, "min_vram_gb": 15},
             priority=10,
         )
@@ -884,7 +884,7 @@ async def test_unplaceable_autodl_job_does_not_starve_institutional_work(
         JobSpec(
             entrypoint="experiment.py",
             source_ref=_source_ref(service),
-            model={"alias": "model", "revision": "rev"},
+            model={"repo_id": "test/model", "revision": "rev"},
             resources={"gpu": 1, "min_vram_gb": 15},
             priority=0,
         )
@@ -938,7 +938,7 @@ async def test_dispatch_pages_past_more_than_one_batch_of_unplaceable_jobs(
             JobSpec(
                 entrypoint="experiment.py",
                 source_ref=source_ref,
-                model={"alias": "model", "revision": "rev"},
+                model={"repo_id": "test/model", "revision": "rev"},
                 resources={"gpu": 1, "min_vram_gb": 15},
                 affinity_site_id="autodl",
                 priority=0 if estimates else 10,
@@ -951,7 +951,7 @@ async def test_dispatch_pages_past_more_than_one_batch_of_unplaceable_jobs(
         JobSpec(
             entrypoint="experiment.py",
             source_ref=source_ref,
-            model={"alias": "model", "revision": "rev"},
+            model={"repo_id": "test/model", "revision": "rev"},
             resources={"gpu": 1, "min_vram_gb": 15},
             priority=0,
             estimated_runtime_seconds=200 if estimates else None,
@@ -1006,7 +1006,7 @@ async def test_replaced_agent_inventory_is_not_combined_with_new_command_lane(
         JobSpec(
             entrypoint="experiment.py",
             source_ref=_source_ref(service),
-            model={"alias": "model", "revision": "rev"},
+            model={"repo_id": "test/model", "revision": "rev"},
             resources={"gpu": 1, "min_vram_gb": 15},
         )
     )

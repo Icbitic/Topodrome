@@ -25,11 +25,9 @@ from topodrome.storage.base import (
     StorageVerificationError,
     VerifiedObject,
 )
+from topodrome.storage.http_mirror import HttpMirrorStorage
 from topodrome.storage.local import LocalStorage
 from topodrome.storage.paths import LogicalPathError, normalize_logical_path, resolve_beneath
-from topodrome.storage.rclone import RcloneCommandReader, RcloneMountStorage
-from topodrome.storage.rclone_mirror import RcloneMirrorStorage
-from topodrome.storage.rclone_mount import RcloneMountError, RcloneMountSupervisor
 
 __all__ = [
     "ArtifactCommitError",
@@ -40,14 +38,10 @@ __all__ = [
     "AuthoritativeDigestReader",
     "CommitManifest",
     "CommittedArtifact",
+    "HttpMirrorStorage",
     "LocalStorage",
     "LogicalPathError",
     "ObjectDigest",
-    "RcloneCommandReader",
-    "RcloneMirrorStorage",
-    "RcloneMountError",
-    "RcloneMountStorage",
-    "RcloneMountSupervisor",
     "ResolvedAsset",
     "StorageAdapter",
     "StorageError",

@@ -77,7 +77,7 @@ async def test_job_idempotency_and_direct_resources_are_owner_scoped(
         spec = {
             "entrypoint": "experiment.py",
             "source_ref": source_ref,
-            "model": "model",
+            "model": "test/model",
             "resources": {"gpu": 1, "min_vram_gb": 1},
         }
         idempotency = {"Idempotency-Key": "same-client-key"}
@@ -187,7 +187,7 @@ async def test_kernel_control_and_ide_credentials_are_owner_scoped(
         created = await client.post(
             "/api/v1/kernels",
             headers=alice,
-            json={"model": "model", "resources": {"gpu": 1}},
+            json={"model": "test/model", "resources": {"gpu": 1}},
         )
         assert created.status_code == 202
         assert created.json()["owner_username"] == "alice"
@@ -292,7 +292,7 @@ async def test_rotation_and_revocation_invalidate_capabilities_without_stopping_
         created = await client.post(
             "/api/v1/kernels",
             headers=alice,
-            json={"model": "model", "resources": {"gpu": 1}},
+            json={"model": "test/model", "resources": {"gpu": 1}},
         )
         session_id = created.json()["session_id"]
         async with database.transaction() as session:

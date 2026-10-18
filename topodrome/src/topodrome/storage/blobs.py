@@ -132,6 +132,11 @@ def publish_artifact_blob(storage, source: Path, *, job_id: str, attempt_id: str
     from topodrome.storage.progress import reuse_verified_outputs
 
     digest = fsync_and_digest(source)
+    fast_publish = getattr(storage, "publish_small_blob", None)
+    if fast_publish is not None:
+        verified = fast_publish(source, job_id=job_id, attempt_id=attempt_id, digest=digest)
+        if verified is not None:
+            return verified
     # An authenticated claim precedes the first remotely visible byte.
     callback = getattr(storage, "claim_blob", None)
     if callback is None:

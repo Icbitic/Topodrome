@@ -129,6 +129,7 @@ class HuggingFaceModelAcquirer:
                 verified = verify_transformers_payload(
                     registered_path,
                     revision=registration.key.revision,
+                    subfolder=registration.key.subfolder,
                     verify_lfs_sha256=bool(
                         re.fullmatch(r"[0-9a-f]{40,64}", registration.key.revision)
                     ),
@@ -145,7 +146,7 @@ class HuggingFaceModelAcquirer:
                 )
         if registration.origin is None:
             raise ModelAcquisitionError(
-                f"model {registration.key.alias!r} has no obtainable origin"
+                f"model {registration.key.repo_id!r} has no obtainable origin"
             )
         token = _secret_value(self.token_provider)
         try:
@@ -159,7 +160,12 @@ class HuggingFaceModelAcquirer:
                     "token": token,
                     "endpoint": self.endpoint.rstrip("/"),
                 }
-                if self.allow_patterns:
+                if registration.key.subfolder is not None:
+                    prefix = registration.key.subfolder
+                    arguments["allow_patterns"] = [
+                        f"{prefix}/{pattern}" for pattern in (self.allow_patterns or ("**",))
+                    ]
+                elif self.allow_patterns:
                     arguments["allow_patterns"] = list(self.allow_patterns)
                 if self.ignore_patterns:
                     arguments["ignore_patterns"] = list(self.ignore_patterns)
@@ -170,7 +176,7 @@ class HuggingFaceModelAcquirer:
             # Hub exceptions frequently include URLs or local paths.  Keep
             # those details out of scheduler-visible error strings.
             raise ModelAcquisitionError(
-                f"failed to acquire model {registration.key.alias!r} at the configured revision"
+                f"failed to acquire model {registration.key.repo_id!r} at the configured revision"
             ) from None
         finally:
             token = None
@@ -187,13 +193,14 @@ class HuggingFaceModelAcquirer:
                 verified = verify_transformers_payload(
                     local_path,
                     revision=registration.key.revision,
+                    subfolder=registration.key.subfolder,
                     verify_lfs_sha256=bool(
                         re.fullmatch(r"[0-9a-f]{40,64}", registration.key.revision)
                     ),
                 )
             except ModelPayloadVerificationError:
                 raise ModelAcquisitionError(
-                    f"acquired model {registration.key.alias!r} failed payload verification"
+                    f"acquired model {registration.key.repo_id!r} failed payload verification"
                 ) from None
             payload_identity = verified.identity_digest
         return ModelRegistration(
@@ -298,19 +305,21 @@ class TransformersLoader:
             return "auto"
         attribute = _DTYPE_ATTRIBUTES.get(key.dtype.casefold())
         if attribute is None:
-            raise ModelLoadError(f"unsupported dtype {key.dtype!r} for model {key.alias!r}")
+            raise ModelLoadError(f"unsupported dtype {key.dtype!r} for model {key.repo_id!r}")
         return getattr(torch, attribute)
 
-    def __call__(self, key: ModelKey) -> LoadedModel:
+    def __call__(self, key: ModelKey | None) -> LoadedModel:
+        if key is None:
+            raise ModelLoadError("TransformersLoader requires a model identity")
         if key != self.registration.key:
             raise ModelLoadError("loader was invoked with an incompatible logical model key")
         local_path = (
             None if self.registration.local_path is None else Path(self.registration.local_path)
         )
         if local_path is not None and not local_path.exists():
-            raise ModelLoadError(f"local files for model {key.alias!r} are unavailable")
+            raise ModelLoadError(f"local files for model {key.repo_id!r} are unavailable")
         if key.quantization and "quantization_config" not in self.model_kwargs:
-            raise ModelLoadError(f"model {key.alias!r} requires an explicit quantization_config")
+            raise ModelLoadError(f"model {key.repo_id!r} requires an explicit quantization_config")
         source = str(local_path) if local_path is not None else self.registration.origin
         assert source is not None
         token = _secret_value(self.token_provider)
@@ -326,6 +335,8 @@ class TransformersLoader:
                 }
                 if local_path is None:
                     shared["revision"] = key.revision
+                if key.subfolder is not None:
+                    shared["subfolder"] = key.subfolder
                 if token is not None:
                     shared["token"] = token
 
@@ -366,7 +377,7 @@ class TransformersLoader:
             # Do not propagate backend messages containing physical paths or
             # authenticated Hub URLs into attempt events.
             raise ModelLoadError(
-                f"failed to load model {key.alias!r} at the configured revision"
+                f"failed to load model {key.repo_id!r} at the configured revision"
             ) from None
         finally:
             token = None
@@ -381,7 +392,23 @@ class TransformersLoader:
             if callable(empty_cache):
                 empty_cache()
 
-        return LoadedModel(model=model, tokenizer=tokenizer, device=self.device, close=close)
+        devices = tuple(torch.device("cuda", index) for index in range(self.sharding_degree or 1))
+        device = torch.device(self.device)
+        # CPU loaders are useful for integration diagnostics too.
+        if self.sharding_degree is None:
+            devices = (device,)
+        loaded = LoadedModel(
+            model=model, tokenizer=tokenizer, device=device, devices=devices, close=close
+        )
+        from .checkpoint_switch import capture_switch_state
+
+        loaded.switch_state = capture_switch_state(self, model)
+        return loaded
+
+    def replace(self, loaded: LoadedModel, previous_key: ModelKey) -> bool:
+        from .checkpoint_switch import replace_weights
+
+        return replace_weights(self, loaded, previous_key)
 
 
 def _verify_exact_gpu_device_map(model: Any, *, degree: int) -> None:

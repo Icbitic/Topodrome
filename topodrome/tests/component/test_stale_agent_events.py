@@ -68,7 +68,7 @@ async def _service_with_expired_attempt(
         ),
         models=(
             ModelCapability(
-                alias="model",
+                repo_id="test/model",
                 revision="revision",
                 backend="transformers",
                 backend_version="test",
@@ -79,7 +79,7 @@ async def _service_with_expired_attempt(
     )
     spec = JobSpec(
         entrypoint="experiment.py",
-        model={"alias": "model", "revision": "revision"},
+        model={"repo_id": "test/model", "revision": "revision"},
         resources={"gpu": 1, "min_vram_gb": 15},
         retry={"max_attempts": 2, "backoff_seconds": 0, "retry_on": {"lost"}},
     )
@@ -378,7 +378,7 @@ async def test_preemption_is_protocol_valid_before_running(
             session,
             JobSpec(
                 entrypoint="experiment.py",
-                model={"alias": "model", "revision": "revision"},
+                model={"repo_id": "test/model", "revision": "revision"},
                 resources={"gpu": 1, "min_vram_gb": 15},
             ),
         )

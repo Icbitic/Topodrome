@@ -28,7 +28,8 @@ async def download_io(operation: Callable[[], T]) -> T:
 
 
 class AssetDownload:
-    def __init__(self, asset: AssetSummary, destination: str | Path) -> None:
+    @staticmethod
+    def validate_manifest(asset):
         files = asset.files
         paths = [item.relative_path for item in files]
         if not paths or paths != sorted(set(paths)):
@@ -47,6 +48,9 @@ class AssetDownload:
             or sum(f.size_bytes for f in files) != asset.total_size_bytes
         ):
             raise ValueError("asset manifest content identity is invalid")
+
+    def __init__(self, asset: AssetSummary, destination: str | Path) -> None:
+        self.validate_manifest(asset)
         self.asset = asset
         self.destination = Path(destination).expanduser().absolute()
         if os.path.lexists(self.destination):

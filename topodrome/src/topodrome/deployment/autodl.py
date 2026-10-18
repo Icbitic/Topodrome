@@ -45,8 +45,6 @@ _CREDENTIAL_URL = re.compile(
 _TEXT_BUNDLE_SUFFIXES = frozenset(
     {".cfg", ".ini", ".json", ".md", ".py", ".sh", ".toml", ".txt", ".yaml", ".yml"}
 )
-_RCLONE_REMOTE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]*$")
-_RCLONE_REMOTE_PATH = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]*$")
 _HF_REPOSITORY = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*$")
 _SSH_HOST = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,252}$")
 _SSH_USER = re.compile(r"^[A-Za-z_][A-Za-z0-9_.-]{0,63}$")
@@ -121,7 +119,6 @@ def build_autodl_bootstrap(
     model_config: str | Path,
     output_dir: str | Path,
     uv_binary: str | Path | None = None,
-    rclone_binary: str | Path | None = None,
     runtime_seed: str | Path | None = None,
     runtime_seed_remote: str | None = None,
     runtime_seed_platform: str | None = None,
@@ -130,8 +127,8 @@ def build_autodl_bootstrap(
     """Build immutable release files and atomically activate their digest.
 
     The bundle contains only Topodrome source, non-secret site/model
-    configuration, the locked dependency graph, and two vetted executables.
-    Virtual environments, package caches, Ray state, and rclone VFS data are
+    configuration, the locked dependency graph, and the uv executable.
+    Virtual environments, package caches, Ray state, and HTTP mirror data are
     deliberately created later on AutoDL's ephemeral filesystem.
     """
 
@@ -165,7 +162,6 @@ def build_autodl_bootstrap(
     seed = _prepare_runtime_seed(
         runtime_seed,
         runtime_seed_remote=runtime_seed_remote,
-        site_remote=str(_mapping(site["rclone"], "site rclone configuration")["remote"]),
         uv_lock_sha256=lock_digest,
         runtime_platform=runtime_platform,
         repository_root=root,
@@ -175,14 +171,6 @@ def build_autodl_bootstrap(
 
     normalized_site = dict(site)
     normalized_site["model_config"] = "config/models.yaml"
-    rclone = dict(_mapping(normalized_site["rclone"], "site rclone configuration"))
-    rclone["binary"] = "rclone"
-    # AutoDL's global mirror is the scheduler's authoritative namespace.
-    # Verify at Lab1; never download uploaded outputs back onto paid compute.
-    rclone["verification_via_scheduler"] = True
-    normalized_site["rclone"] = rclone
-
-    rclone_path = _executable(rclone_binary, "rclone")
     members = _repository_members(root)
     site_bytes = yaml.safe_dump(normalized_site, sort_keys=True).encode()
     model_bytes = yaml.safe_dump(models, sort_keys=True).encode()
@@ -191,7 +179,6 @@ def build_autodl_bootstrap(
             _BundleMember("config/site.yaml", 0o600, content=site_bytes),
             _BundleMember("config/models.yaml", 0o600, content=model_bytes),
             _BundleMember("tools/uv", 0o700, source=uv_path),
-            _BundleMember("tools/rclone", 0o700, source=rclone_path),
         )
     )
     _reject_bundle_credentials(members)
@@ -206,6 +193,7 @@ def build_autodl_bootstrap(
             else {
                 "format": "site-packages-tar-gz",
                 "remote": seed.remote,
+                "logical_path": "bootstrap/" + seed.remote.split("bootstrap/", 1)[1],
                 "sha256": seed.sha256,
                 "size_bytes": seed.size_bytes,
                 "member_count": seed.member_count,
@@ -215,10 +203,13 @@ def build_autodl_bootstrap(
                 "requires_online_repair": seed.requires_online_repair,
             }
         ),
-        "tools": {
-            "uv_sha256": _sha256(uv_path),
-            "rclone_sha256": _sha256(rclone_path),
+        "http_storage": {
+            "bulk_url": normalized_site["storage"].get(
+                "bulk_url", normalized_site["scheduler_url"]
+            ),
+            "bulk_ssh_local_forward": normalized_site.get("bulk_ssh_local_forward"),
         },
+        "tools": {"uv_sha256": _sha256(uv_path)},
     }
     members.append(
         _BundleMember(
@@ -291,7 +282,6 @@ def _prepare_runtime_seed(
     value: str | Path | None,
     *,
     runtime_seed_remote: str | None,
-    site_remote: str,
     uv_lock_sha256: str,
     runtime_platform: _RuntimePlatform | None,
     repository_root: Path,
@@ -330,19 +320,16 @@ def _prepare_runtime_seed(
         )
     digest = _sha256(path)
     platform_key = runtime_platform.key
-    remote_root = _validate_rclone_reference(site_remote, label="site rclone remote")
-    remote_prefix = remote_root if remote_root.endswith(":") else f"{remote_root.rstrip('/')}/"
     default_remote = (
-        f"{remote_prefix}bootstrap/runtime-seeds/{uv_lock_sha256}/"
-        f"{platform_key}/runtime-seed-{digest}.tar.gz"
+        f"bootstrap/runtime-seeds/{uv_lock_sha256}/{platform_key}/runtime-seed-{digest}.tar.gz"
     )
-    remote = _validate_rclone_reference(
-        default_remote if runtime_seed_remote is None else runtime_seed_remote,
-        label="runtime seed remote",
+    from topodrome.storage.paths import normalize_logical_path
+
+    remote = normalize_logical_path(
+        default_remote if runtime_seed_remote is None else runtime_seed_remote
     )
-    required_prefix = remote_prefix
-    if not remote.startswith(required_prefix):
-        raise ValueError("runtime seed remote must be inside the configured Lab1 rclone root")
+    if not remote.startswith("bootstrap/runtime-seeds/"):
+        raise ValueError("runtime seed must be under bootstrap/runtime-seeds")
     if not all(component in remote for component in (uv_lock_sha256, platform_key, digest)):
         raise ValueError(
             "runtime seed remote must be keyed by uv.lock, target platform, and seed digest"
@@ -365,9 +352,7 @@ def _runtime_platform(value: str | None) -> _RuntimePlatform:
     if value is not None:
         match = _RUNTIME_SEED_TARGET.fullmatch(value)
         if match is None:
-            raise ValueError(
-                "runtime_seed_platform must look like x86_64-manylinux_2_31"
-            )
+            raise ValueError("runtime_seed_platform must look like x86_64-manylinux_2_31")
         machine = match.group("machine")
         libc_name = "glibc" if match.group("libc") == "manylinux" else "musl"
         libc_version = f"{int(match.group('major'))}.{int(match.group('minor'))}"
@@ -391,9 +376,7 @@ def _runtime_platform(value: str | None) -> _RuntimePlatform:
             raise ValueError(
                 "AutoDL runtime seed platform must identify Linux architecture and libc version"
             )
-        libc_version = (
-            f"{int(version_match.group('major'))}.{int(version_match.group('minor'))}"
-        )
+        libc_version = f"{int(version_match.group('major'))}.{int(version_match.group('minor'))}"
         if libc_name == "glibc":
             major, minor = libc_version.split(".", 1)
             uv_target = f"{machine}-manylinux_{major}_{minor}"
@@ -562,32 +545,6 @@ def _inspect_runtime_seed(path: Path) -> _RuntimeSeedInspection:
     )
 
 
-def _validate_rclone_reference(value: str, *, label: str) -> str:
-    if (
-        not isinstance(value, str)
-        or value != value.strip()
-        or any(character in value for character in "\r\n\0\\?#@")
-    ):
-        raise ValueError(f"{label} must be a credential-free named rclone reference")
-    remote_name, separator, raw_path = value.partition(":")
-    logical_path = PurePosixPath(raw_path) if raw_path else None
-    if (
-        not separator
-        or not _RCLONE_REMOTE_NAME.fullmatch(remote_name)
-        or (
-            raw_path
-            and (
-                not _RCLONE_REMOTE_PATH.fullmatch(raw_path)
-                or logical_path is None
-                or logical_path.is_absolute()
-                or ".." in logical_path.parts
-            )
-        )
-    ):
-        raise ValueError(f"{label} must be a credential-free named rclone reference")
-    return f"{remote_name}:{logical_path.as_posix() if logical_path is not None else ''}"
-
-
 def _reject_bundle_credentials(members: Sequence[_BundleMember]) -> None:
     for member in members:
         suffix = PurePosixPath(member.name).suffix.casefold()
@@ -635,30 +592,30 @@ def _validate_site_config(site: Mapping[str, Any]) -> None:
     _require_under(site.get("scratch_root"), _EPHEMERAL_ROOT, "scratch_root")
     _require_under(site.get("spool_path"), _PERSISTENT_ROOT, "spool_path")
 
-    rclone = _mapping(site.get("rclone"), "site rclone configuration")
-    rclone_mode = rclone.get("mode", "mount")
-    if rclone_mode not in {"mount", "mirror"}:
-        raise ValueError("rclone mode must be mount or mirror")
-    mountpoint = _absolute_path(rclone.get("mountpoint"), "rclone mountpoint")
-    global_root = _absolute_path(site.get("global_root"), "global_root")
-    if mountpoint != global_root:
-        raise ValueError("global_root must equal the managed rclone mountpoint")
-    if rclone_mode == "mirror":
-        _require_under(str(global_root), _EPHEMERAL_ROOT, "mirror global_root")
-    _require_under(rclone.get("cache_dir"), _EPHEMERAL_ROOT, "rclone cache_dir")
-    remote = rclone.get("remote")
-    if not isinstance(remote, str):
-        raise ValueError("rclone remote must be configured without embedded credentials")
-    _validate_rclone_reference(remote, label="rclone remote")
+    from topodrome.config import SiteSettings, validate_site_fields
+
+    validate_site_fields(dict(site))
+    if site.get("storage") is None:
+        raise ValueError("AutoDL requires an HTTP storage mirror")
+    # Actual credentials come only from the protected deployment environment.
+    SiteSettings(_env_file=None, **{**site, "fence_verification_key": "v" * 32})
+    _require_under(site.get("global_root"), _EPHEMERAL_ROOT, "HTTP mirror global_root")
     _validate_control_tunnel(site.get("ssh_local_forward"), control_url=control_url)
 
 
 def _validate_model_config(models: Mapping[str, Any], *, site_id: str) -> None:
+    from topodrome.config import ModelCatalog, ModelDefinition
+
     definitions = _mapping(models.get("models"), "model catalog")
     if not definitions:
         raise ValueError("model catalog must contain at least one model")
+    catalog = ModelCatalog(models={
+        repo_id: ModelDefinition(repo_id=repo_id, **dict(_mapping(value, "model definition")))
+        for repo_id, value in definitions.items()
+    })
     found = False
-    for alias, raw_definition in definitions.items():
+    for variant in catalog.variants():
+        alias, raw_definition = variant.repo_id, variant.model_dump(mode="json")
         definition = _mapping(raw_definition, f"model {alias!r}")
         sites = _mapping(definition.get("sites"), f"model {alias!r} sites")
         if site_id not in sites:
@@ -895,15 +852,14 @@ def main(argv: Sequence[str] | None = None) -> None:
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--repository-root", type=Path, default=Path.cwd())
     parser.add_argument("--uv-binary", type=Path)
-    parser.add_argument("--rclone-binary", type=Path)
     parser.add_argument(
         "--runtime-seed",
         type=Path,
-        help="verified site-packages .tar.gz staged separately on the Lab1 rclone remote",
+        help="verified site-packages .tar.gz staged separately under the Lab1 global root",
     )
     parser.add_argument(
         "--runtime-seed-remote",
-        help="credential-free Lab1 rclone object; defaults to a lock/platform/hash keyed path",
+        help="Lab1 logical seed path; defaults to a lock/platform/hash keyed bootstrap path",
     )
     parser.add_argument(
         "--runtime-seed-platform",
@@ -924,7 +880,6 @@ def main(argv: Sequence[str] | None = None) -> None:
         model_config=arguments.model_config,
         output_dir=arguments.output_dir,
         uv_binary=arguments.uv_binary,
-        rclone_binary=arguments.rclone_binary,
         runtime_seed=arguments.runtime_seed,
         runtime_seed_remote=arguments.runtime_seed_remote,
         runtime_seed_platform=arguments.runtime_seed_platform,

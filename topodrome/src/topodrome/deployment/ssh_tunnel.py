@@ -27,7 +27,7 @@ from collections.abc import Iterator, Sequence
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from pathlib import Path
-from typing import IO, Any
+from typing import IO, Any, Protocol
 from uuid import uuid4
 
 _FORMAT_VERSION = 1
@@ -162,10 +162,7 @@ class TunnelOwnershipRecord:
 
     def validate(self) -> None:
         self.identity.validate()
-        if (
-            not re.fullmatch(r"[0-9a-f]{64}", self.configuration_sha256)
-            or self.created_at <= 0
-        ):
+        if not re.fullmatch(r"[0-9a-f]{64}", self.configuration_sha256) or self.created_at <= 0:
             raise ValueError("invalid tunnel ownership record")
 
     def as_dict(self) -> dict[str, object]:
@@ -207,6 +204,7 @@ class SSHLocalForwardSupervisor:
 
         state_root = _prepare_private_directory(self.config.state_directory)
         with _locked_file(state_root / "ssh-local-forward.lock"):
+            self._reap_exited_child()
             configuration_sha256 = _configuration_sha256(self.config)
             existing = _read_record(self.state_path)
             if existing is not None:
@@ -222,7 +220,9 @@ class SSHLocalForwardSupervisor:
                         local_port=self.config.local_port,
                         adopted=True,
                     )
-                if _process_group_exists(existing.identity.process_group_id):
+                if _process_group_exists(existing.identity.process_group_id) and not (
+                    _only_owned_zombies_remain(existing.identity)
+                ):
                     raise SSHLocalForwardError(
                         "the recorded tunnel process group is live but its identity changed"
                     )
@@ -282,11 +282,14 @@ class SSHLocalForwardSupervisor:
 
         state_root = _prepare_private_directory(self.config.state_directory)
         with _locked_file(state_root / "ssh-local-forward.lock"):
+            self._reap_exited_child()
             record = _read_record(self.state_path)
             if record is None:
                 return False
             if not _process_matches(record.identity):
-                if _process_group_exists(record.identity.process_group_id):
+                if _process_group_exists(record.identity.process_group_id) and not (
+                    _only_owned_zombies_remain(record.identity)
+                ):
                     raise SSHLocalForwardError(
                         "refusing to signal a tunnel process group with changed identity"
                     )
@@ -304,6 +307,13 @@ class SSHLocalForwardSupervisor:
             _remove_record_if_equal(self.state_path, record)
             self._process = None
             return True
+
+    def _reap_exited_child(self) -> None:
+        # Popen retains the exact child until waitpid reaps it. An unreaped
+        # exit has an empty cmdline but still makes killpg(pgid, 0) succeed;
+        # treating that zombie as changed live ownership prevents all retries.
+        if self._process is not None and self._process.poll() is not None:
+            self._process = None
 
     def _spawn(
         self,
@@ -651,6 +661,40 @@ def _process_group_exists(process_group_id: int) -> bool:
     return True
 
 
+def _only_owned_zombies_remain(identity: TunnelProcessIdentity) -> bool:
+    """Recognize a dead adopted leader without signalling or reaping strangers.
+
+    A replacement supervisor cannot waitpid the old parent's child. A proven
+    zombie has no sockets or ability to execute; still refuse recovery if any
+    live member of its group remains or ownership cannot be established.
+    """
+    try:
+        proc = Path(f"/proc/{identity.pid}")
+        start, state = _process_stat(identity.pid)
+        if (
+            state != "Z"
+            or start != identity.start_ticks
+            or _boot_id() != identity.boot_id
+            or identity.uid != os.geteuid()
+            or proc.stat().st_uid != identity.uid
+            or os.getpgid(identity.pid) != identity.process_group_id
+        ):
+            return False
+        for entry in Path("/proc").iterdir():
+            if not entry.name.isdigit():
+                continue
+            try:
+                raw = (entry / "stat").read_text(encoding="utf-8")
+                fields = raw.rsplit(")", 1)[1].split()
+                if int(fields[2]) == identity.process_group_id and fields[0] != "Z":
+                    return False
+            except (FileNotFoundError, ProcessLookupError):
+                continue
+        return True
+    except (OSError, ValueError, IndexError):
+        return False
+
+
 def _terminate_exact(
     identity: TunnelProcessIdentity,
     *,
@@ -711,6 +755,11 @@ def _terminate_spawned_process(
 def _port_is_free(host: str, port: int) -> bool:
     family = socket.AF_INET6 if host == "::1" else socket.AF_INET
     with socket.socket(family, socket.SOCK_STREAM) as probe:
+        # Match OpenSSH's listener semantics. A stopped forward can leave
+        # accepted connections in TIME_WAIT; those are not a foreign listener
+        # and must not block an immediate, idle-gated agent restart. This does
+        # not enable SO_REUSEPORT or permit sharing a live listening socket.
+        probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         try:
             probe.bind((host, port))
         except OSError:
@@ -775,9 +824,49 @@ def _fsync_directory(path: Path) -> None:
         os.close(descriptor)
 
 
+class LocalForwardLifecycle(Protocol):
+    """Common ownership lifecycle for a fixed route or bounded route manager."""
+
+    def ensure_running(self) -> object: ...
+
+    def stop(self) -> object: ...
+
+
+class SSHLocalForwardGroup:
+    """Own independent control and bulk TCP routes for one agent lifetime."""
+
+    def __init__(self, tunnels: Sequence[LocalForwardLifecycle]) -> None:
+        self.tunnels = tuple(tunnels)
+
+    def ensure_running(self) -> None:
+        first_error: Exception | None = None
+        for tunnel in self.tunnels:
+            try:
+                tunnel.ensure_running()
+            except Exception as exc:
+                # A broken bulk route must not tear down a healthy control
+                # route. Initial construction owns rollback for both routes.
+                if first_error is None:
+                    first_error = exc
+        if first_error is not None:
+            raise first_error
+
+    def stop(self) -> None:
+        first_error: BaseException | None = None
+        for tunnel in reversed(self.tunnels):
+            try:
+                tunnel.stop()
+            except BaseException as exc:
+                if first_error is None:
+                    first_error = exc
+        if first_error is not None:
+            raise first_error
+
+
 __all__ = [
     "SSHLocalForwardConfig",
     "SSHLocalForwardError",
+    "SSHLocalForwardGroup",
     "SSHLocalForwardStatus",
     "SSHLocalForwardSupervisor",
     "TunnelOwnershipRecord",

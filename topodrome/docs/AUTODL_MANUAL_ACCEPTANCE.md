@@ -8,7 +8,7 @@ used. The scheduler's failed-registration cleanup update is deployed.
 - Hermetic suite: 997 unit/component tests passed; Ruff passed.
 - Published bootstrap: `2f60d0fec9a56ae77ac0643a902795183b6b3cd0e0dc73d962bbc9960fbcc80c`.
   It contains the cleanup fix, no retired provider API client, and
-  `rclone.verification_via_scheduler: true`.
+  scheduler-authoritative output verification.
 - The previously verified regional runtime seed was retained; no new dependency
   seed or model download was needed for the test.
 - An operator-supplied RTX 5090 registered and became ready.

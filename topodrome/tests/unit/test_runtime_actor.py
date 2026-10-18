@@ -18,9 +18,9 @@ from topodrome.runtime import (
 )
 
 
-def model_key(alias: str = "llama") -> ModelKey:
+def model_key(repo_id: str = "test/llama") -> ModelKey:
     return ModelKey(
-        alias=alias,
+        repo_id=repo_id,
         revision="exact-revision",
         backend="test",
         backend_version="1",
@@ -28,8 +28,8 @@ def model_key(alias: str = "llama") -> ModelKey:
     )
 
 
-def actor_key(alias: str = "llama") -> ActorKey:
-    return ActorKey(site_id="lab1", gpu_uuid="GPU-1234", model=model_key(alias))
+def actor_key(repo_id: str = "test/llama") -> ActorKey:
+    return ActorKey(site_id="lab1", gpu_uuid="GPU-1234", model=model_key(repo_id))
 
 
 def test_warm_actor_is_reused_and_concurrent_runs_are_serialized() -> None:
@@ -41,7 +41,7 @@ def test_warm_actor_is_reused_and_concurrent_runs_are_serialized() -> None:
 
     def loader(key: ModelKey) -> LoadedModel:
         loads.append(key)
-        return LoadedModel(model={"identity": key.alias}, tokenizer="tokenizer", device="cuda:0")
+        return LoadedModel(model={"identity": key.repo_id}, tokenizer="tokenizer", device="cuda:0")
 
     def experiment(context, *, value: int) -> int:
         nonlocal active, maximum_active
@@ -49,7 +49,7 @@ def test_warm_actor_is_reused_and_concurrent_runs_are_serialized() -> None:
             active += 1
             maximum_active = max(maximum_active, active)
         time.sleep(0.03)
-        assert context.model["identity"] == "llama"
+        assert context.model["identity"] == "test/llama"
         with guard:
             active -= 1
         return value * 2
@@ -130,16 +130,16 @@ def test_incompatible_idle_actor_is_evicted_before_replacement() -> None:
 
     def loader(key: ModelKey) -> LoadedModel:
         return LoadedModel(
-            model=key.alias,
-            close=lambda: disposed.append(key.alias),
+            model=key.repo_id,
+            close=lambda: disposed.append(key.repo_id),
         )
 
-    first = manager.get_or_create(actor_key("first"), loader)
-    second = manager.get_or_create(actor_key("second"), loader)
+    first = manager.get_or_create(actor_key("test/first"), loader)
+    second = manager.get_or_create(actor_key("test/second"), loader)
 
     assert first.state is ActorState.STOPPED
     assert second.state is ActorState.IDLE
-    assert disposed == ["first"]
+    assert disposed == ["test/first"]
     assert manager.get("lab1", "GPU-1234") is second
 
 

@@ -28,6 +28,9 @@ class RecordingStorage:
     def resolve(self, logical_path: str) -> Path:
         return self.delegate.resolve(logical_path)
 
+    def resolve_writable(self, logical_path: str) -> Path:
+        return self.delegate.resolve_writable(logical_path)
+
     def flush_and_verify(
         self,
         logical_path: str,

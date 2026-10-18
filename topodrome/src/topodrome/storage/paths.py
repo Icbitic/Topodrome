@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import stat
 from pathlib import Path, PurePosixPath
 
 
@@ -52,4 +53,35 @@ def validate_component(value: str, *, label: str = "identifier") -> str:
     return normalized
 
 
-__all__ = ["LogicalPathError", "normalize_logical_path", "resolve_beneath", "validate_component"]
+def resolve_writable_beneath(root: Path | str, logical_path: str | PurePosixPath) -> Path:
+    """Resolve a canonical write location, refusing aliases and special files.
+
+    This does not create, download or materialize anything. Read-only directory
+    caches must never determine where an attempt writes its local state.
+    """
+    normalized = normalize_logical_path(logical_path)
+    candidate = Path(root).expanduser().resolve()
+    parts = normalized.split("/")
+    for index, part in enumerate(parts):
+        candidate = candidate / part
+        try:
+            metadata = candidate.lstat()
+        except FileNotFoundError:
+            continue
+        if stat.S_ISLNK(metadata.st_mode):
+            raise LogicalPathError("writable path must not contain symbolic links")
+        if index < len(parts) - 1:
+            if not stat.S_ISDIR(metadata.st_mode):
+                raise LogicalPathError("writable path parent must be a directory")
+        elif not (stat.S_ISDIR(metadata.st_mode) or stat.S_ISREG(metadata.st_mode)):
+            raise LogicalPathError("writable path must be a regular file or directory")
+    return candidate
+
+
+__all__ = [
+    "LogicalPathError",
+    "normalize_logical_path",
+    "resolve_beneath",
+    "resolve_writable_beneath",
+    "validate_component",
+]

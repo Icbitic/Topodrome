@@ -13,6 +13,7 @@ import re
 import shutil
 import threading
 import traceback
+import weakref
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from contextlib import redirect_stderr, redirect_stdout, suppress
 from dataclasses import dataclass, replace
@@ -38,6 +39,7 @@ from topodrome.runtime import (
     invoke_experiment,
 )
 from topodrome.runtime.environment import configure_ray_driver_environment
+from topodrome.runtime.gpu_job import GPUJobLoader
 from topodrome.source_layout import (
     SOURCE_BUNDLE_FORMAT_VERSION,
     SOURCE_BUNDLE_MANIFEST_NAME,
@@ -387,8 +389,13 @@ class RuntimeExecutionBackend:
     """Load exact single- or multi-GPU model runtimes and commit durable outputs."""
 
     @property
+    def supports_model_free(self) -> bool:
+        return self.use_ray
+
+    @property
     def storage_authoritative(self) -> bool:
         from topodrome.storage.local import LocalStorage
+
         return isinstance(self.storage, LocalStorage)
 
     def __init__(
@@ -412,6 +419,10 @@ class RuntimeExecutionBackend:
         finalization_concurrency: int = 2,
         checkpoint_keep_snapshots: int = 2,
         finalization_journal=None,
+        checkpoint_prefetch_max_bytes: int = 16 * 1024**3,
+        checkpoint_prefetch_concurrency: int = 1,
+        checkpoint_prefetch_memory_floor_bytes: int = 16 * 1024**3,
+        memory_available=None,
     ) -> None:
         if ray_connect_timeout_seconds <= 0 or ray_control_timeout_seconds <= 0:
             raise ValueError("Ray connection and control timeouts must be positive")
@@ -440,13 +451,115 @@ class RuntimeExecutionBackend:
         self._ray_lock = threading.Lock()
         self._prepared: dict[str, tuple[PreparedActor, str]] = {}
         self._prepared_lock = threading.RLock()
+        self._actor_lifecycle_locks: weakref.WeakValueDictionary[str, asyncio.Lock] = (
+            weakref.WeakValueDictionary()
+        )
         self._confirmed_stale_actor_ids: set[str] = set()
         self._finalization_slots = asyncio.Semaphore(finalization_concurrency)
         self._finalization_cancellations: dict[str, threading.Event] = {}
         self.finalization_journal = finalization_journal
         self.finalization_authority = lambda attempt_id: True
+        from topodrome.runtime.model_prefetch import ModelPrefetcher
+
+        self.model_prefetcher = ModelPrefetcher(
+            max_bytes=checkpoint_prefetch_max_bytes,
+            concurrency=checkpoint_prefetch_concurrency,
+            memory_floor_bytes=checkpoint_prefetch_memory_floor_bytes,
+            memory_available=memory_available,
+        )
+
+    def switch_source(self, assignment: Assignment) -> PreparedRuntime | None:
+        actor_id = assignment.lease.runtime_switch_actor_id
+        if actor_id is None:
+            return None
+        with self._prepared_lock:
+            value = self._prepared.get(actor_id)
+        if value is None or value[1] != assignment.lease.runtime_switch_model_key:
+            raise RuntimeError("runtime replacement lost its exact source handle")
+        handle, model_key = value
+        return PreparedRuntime(
+            actor_id=handle.actor_id,
+            model_key=model_key,
+            reused=True,
+            opaque=_RuntimeHandle(handle, self._owner),
+            process_ids=handle.worker_pids,
+        )
+
+    async def switchable_runtime(self, assignment, allocations) -> PreparedRuntime | None:
+        """Propose an idle whole-worker switch, without changing any state."""
+        spec = JobSpec.model_validate(assignment.raw_spec)
+        if (
+            not self.use_ray
+            or spec.model is None
+            or spec.workload_kind.value != "batch"
+            or spec.execution_mode not in {"single", "model_sharded"}
+            or any(item is None for item in allocations)
+            or not allocations
+        ):
+            return None
+        ordered = tuple(allocations)
+        if (
+            len({item.actor_id for item in ordered}) != 1
+            or len({item.model_key for item in ordered}) != 1
+            or tuple(item.replica_rank for item in ordered) != tuple(range(len(ordered)))
+            or any(item.state != "idle" for item in ordered)
+        ):
+            return None
+        actor_id = ordered[0].actor_id
+        with self._prepared_lock:
+            value = self._prepared.get(actor_id)
+        if value is None:
+            return None
+        handle, serialized = value
+        old = handle.key.model
+        try:
+            new = self._resolve_registration(spec.model.model_dump()).key
+        except (KeyError, ValueError):
+            return None
+        if (
+            serialized != ordered[0].model_key
+            or old is None
+            or old == new
+            or handle.key.replica_gpu_uuids != assignment.lease.gpu_uuids
+            or handle.key.runtime_fingerprint != spec.runtime_fingerprint
+            or old.backend != "transformers"
+            or new.backend != "transformers"
+            or old.backend_version != new.backend_version
+            or any((old.quantization, old.adapter, new.quantization, new.adapter))
+            or not await _to_thread(self.runtime.core.can_switch_model, handle)
+        ):
+            return None
+        return PreparedRuntime(
+            actor_id=actor_id,
+            model_key=serialized,
+            reused=True,
+            opaque=_RuntimeHandle(handle, self._owner),
+            process_ids=handle.worker_pids,
+        )
 
     async def prepare(
+        self,
+        assignment: Assignment,
+        workspace: AttemptWorkspace,
+    ) -> PreparedRuntime:
+        actor_id = assignment.lease.runtime_switch_actor_id
+        if actor_id is not None:
+            # A heartbeat must not interpret LOADING or the old prepared key
+            # during replacement as proof that this exact worker is dead.
+            # Serialize only this actor, through publication of its new key.
+            async with self._actor_lifecycle_lock(actor_id):
+                return await self._prepare(assignment, workspace)
+        return await self._prepare(assignment, workspace)
+
+    def _actor_lifecycle_lock(self, actor_id: str) -> asyncio.Lock:
+        with self._prepared_lock:
+            lock = self._actor_lifecycle_locks.get(actor_id)
+            if lock is None:
+                lock = asyncio.Lock()
+                self._actor_lifecycle_locks[actor_id] = lock
+            return lock
+
+    async def _prepare(
         self,
         assignment: Assignment,
         workspace: AttemptWorkspace,
@@ -460,19 +573,30 @@ class RuntimeExecutionBackend:
         except KeyError as exc:
             raise RuntimeError("physical GPU index was not preserved after admission") from exc
 
-        model = _mapping(assignment.raw_spec.get("model"), "assignment model")
-        registration = self._resolve_registration(model)
-        if registration.key.quantization != _optional_text(model.get("quantization")):
-            raise RuntimeError("registered model has an incompatible quantization mode")
-        if registration.key.adapter != _optional_text(model.get("adapter")):
-            raise RuntimeError("registered model has an incompatible adapter identity")
-        if self.acquirer is not None:
-            acquired = await _to_thread(self.acquirer, registration)
-            if acquired.key != registration.key:
-                raise RuntimeError("model acquisition changed the exact model identity")
-            registration = acquired
-            self.registry.register(registration, replace=True)
-        loader = self.loader_factory(registration)
+        model_key = None
+        loader: ModelLoader
+        if job_spec.model is None:
+            if not self.use_ray:
+                raise RuntimeError("model-free GPU jobs require an isolated site-local Ray worker")
+            loader = GPUJobLoader(1 if job_spec.execution_mode == "distributed" else len(gpu_uuids))
+            # CUDA and NVML numeric orders can differ. Use the admitted physical
+            # UUIDs directly; torch.device ordinals follow this visibility order.
+            gpu_indices = gpu_uuids
+        else:
+            model = _mapping(assignment.raw_spec.get("model"), "assignment model")
+            registration = self._resolve_registration(model)
+            if registration.key.quantization != _optional_text(model.get("quantization")):
+                raise RuntimeError("registered model has an incompatible quantization mode")
+            if registration.key.adapter != _optional_text(model.get("adapter")):
+                raise RuntimeError("registered model has an incompatible adapter identity")
+            if self.acquirer is not None:
+                acquired = await _to_thread(self.acquirer, registration)
+                if acquired.key != registration.key:
+                    raise RuntimeError("model acquisition changed the exact model identity")
+                registration = acquired
+                self.registry.register(registration, replace=True)
+            model_key = registration.key
+            loader = self.loader_factory(registration)
         if self.use_ray:
             await asyncio.wait_for(
                 _to_thread(self._ensure_ray_driver),
@@ -482,7 +606,7 @@ class RuntimeExecutionBackend:
             ActorKey(
                 self.site_id,
                 gpu_uuid,
-                registration.key,
+                model_key,
                 runtime_fingerprint=job_spec.runtime_fingerprint,
             )
             for gpu_uuid in gpu_uuids
@@ -503,14 +627,16 @@ class RuntimeExecutionBackend:
             "env": job_spec.runtime.env,
             "working_dir": working_dir,
         }
-        parallelism = job_spec.model.parallelism
+        if assignment.lease.runtime_switch_actor_id is not None:
+            runtime_options["expected_switch_actor_id"] = assignment.lease.runtime_switch_actor_id
+        parallelism = job_spec.model.parallelism if job_spec.model is not None else None
         if isinstance(parallelism, ModelShardedParallelism):
             if not self.use_ray:
                 raise RuntimeError("model-sharded inference requires the site-local Ray runtime")
             replica_key = ActorKey(
                 self.site_id,
                 gpu_uuids[0],
-                registration.key,
+                model_key,
                 runtime_fingerprint=job_spec.runtime_fingerprint,
                 replica_gpu_uuids=gpu_uuids,
             )
@@ -521,6 +647,23 @@ class RuntimeExecutionBackend:
                     cuda_visible_devices=gpu_indices,
                     strategy=parallelism.strategy,
                     max_memory_bytes_per_gpu=round(parallelism.max_memory_gb_per_gpu * 1024**3),
+                    **runtime_options,
+                )
+            )
+        elif job_spec.model is None and job_spec.execution_mode == "single":
+            replica_key = ActorKey(
+                self.site_id,
+                gpu_uuids[0],
+                None,
+                runtime_fingerprint=job_spec.runtime_fingerprint,
+                replica_gpu_uuids=gpu_uuids,
+            )
+            prepared = await self._await_runtime_preparation(
+                self.runtime.prepare(
+                    replica_key,
+                    loader,
+                    use_ray=True,
+                    cuda_visible_device=",".join(gpu_indices),
                     **runtime_options,
                 )
             )
@@ -553,6 +696,13 @@ class RuntimeExecutionBackend:
                 or actor_id == prepared.actor_id
             }
             self._prepared[prepared.actor_id] = (prepared, assignment.model_key)
+        if assignment.next_model is not None and job_spec.workload_kind.value == "batch":
+            # Only the exact locally registered snapshot may be read ahead.
+            # Hints do not download models, acquire GPUs, or admit another job.
+            with suppress(Exception):
+                hinted = self._resolve_registration(assignment.next_model)
+                if hinted.key != model_key:
+                    self.model_prefetcher.schedule(hinted)
         return PreparedRuntime(
             actor_id=prepared.actor_id,
             model_key=assignment.model_key,
@@ -571,6 +721,7 @@ class RuntimeExecutionBackend:
         attached Topodrome driver during service shutdown.
         """
 
+        self.model_prefetcher.close()
         if not self.use_ray:
             return False
         return await asyncio.wait_for(
@@ -675,7 +826,7 @@ class RuntimeExecutionBackend:
             raise
         if not isinstance(report, _ExecutionReport):
             raise RuntimeError("model actor returned an invalid execution report")
-        parallelism_mode = JobSpec.model_validate(assignment.raw_spec).model.parallelism.mode
+        parallelism_mode = JobSpec.model_validate(assignment.raw_spec).execution_mode
         reusable = (
             assignment.lease.allow_actor_reuse
             and parallelism_mode in {"single", "model_sharded"}
@@ -705,8 +856,9 @@ class RuntimeExecutionBackend:
                 except TimeoutError:
                     continue
             try:
-                with cancellable_transfers(canceled), transfer_authority(
-                    lambda: self.finalization_authority(assignment.attempt_id)
+                with (
+                    cancellable_transfers(canceled),
+                    transfer_authority(lambda: self.finalization_authority(assignment.attempt_id)),
                 ):
                     operation = asyncio.create_task(
                         self._retry_finalization(assignment, workspace, report, reusable, canceled)
@@ -737,14 +889,19 @@ class RuntimeExecutionBackend:
                     with reuse_verified_outputs():
                         return await self._finalize_outputs(assignment, workspace, report, reusable)
                 return await self._finalize_outputs(assignment, workspace, report, reusable)
-            except (StorageUnavailableError, TimeoutError, OSError):
+            except (StorageUnavailableError, TimeoutError):
                 if self.finalization_journal is None:
                     raise
+                # Transport failures are typed by the storage adapters. A
+                # missing local file, permissions or disk error cannot be
+                # repaired by retrying the network forever; retain diagnostics
+                # and the recovery receipt through the ordinary failure path.
                 TransferLogReporter(workspace.log_dir / "attempt.log")("upload-retry")
                 # Retry transport only. No actor is reachable from this loop.
                 for _ in range(delay * 5):
                     if canceled.is_set():
                         from topodrome.storage.progress import TransferCancelled
+
                         raise TransferCancelled("transfer canceled") from None
                     await asyncio.sleep(0.2)
                 delay = min(30, delay * 2)
@@ -760,7 +917,9 @@ class RuntimeExecutionBackend:
                 if registration.required:
                     raise RuntimeError("required artifact missing at compute completion")
                 continue
-            target = self.storage.resolve(f"{store.staging_prefix}/{registration.logical_path}")
+            target = self.storage.resolve_writable(
+                f"{store.staging_prefix}/{registration.logical_path}"
+            )
             if source != target.resolve():
                 store.stage_file(source, registration.logical_path)
             paths.add(registration.logical_path)
@@ -771,10 +930,15 @@ class RuntimeExecutionBackend:
             with target.open("rb") as stream:
                 os.fsync(stream.fileno())
             _fsync_directory(target.parent)
-        self.finalization_journal.save({
-            "version": 1, "job_id": assignment.job_id, "attempt_id": assignment.attempt_id,
-            "output_paths": sorted(paths), "checkpoint_ref": report.checkpoint_ref,
-        })
+        self.finalization_journal.save(
+            {
+                "version": 1,
+                "job_id": assignment.job_id,
+                "attempt_id": assignment.attempt_id,
+                "output_paths": sorted(paths),
+                "checkpoint_ref": report.checkpoint_ref,
+            }
+        )
         return replace(report, artifacts=(), output_paths=tuple(sorted(paths)))
 
     async def resume_finalization(self, assignment, workspace, receipt):
@@ -991,7 +1155,9 @@ class RuntimeExecutionBackend:
                     },
                 }
             )
-            if isinstance(parsed.model.parallelism, ModelShardedParallelism):
+            if parsed.model is None or isinstance(
+                parsed.model.parallelism, ModelShardedParallelism
+            ):
                 return None
             registration = self._resolve_registration(model)
         except (KeyError, TypeError, ValueError):
@@ -1097,7 +1263,8 @@ class RuntimeExecutionBackend:
             (
                 (prepared, serialized_model_key)
                 for prepared, serialized_model_key in tracked
-                if prepared.transport is not ExecutionTransport.RAY_GROUP
+                if prepared.key.model is not None
+                and prepared.transport is not ExecutionTransport.RAY_GROUP
                 and self.runtime.core.is_live(prepared, require_idle=True)
             ),
             key=lambda value: (value[0].key.model, value[0].key.gpu_uuid),
@@ -1114,6 +1281,7 @@ class RuntimeExecutionBackend:
             )
             capabilities.append(value)
         for prepared, serialized_model_key in warm_actors:
+            assert prepared.key.model is not None
             for gpu_uuid in prepared.key.replica_gpu_uuids:
                 warm_value: dict[str, Any] = dict(prepared.key.model.as_dict())
                 warm_value.update(
@@ -1184,19 +1352,30 @@ class RuntimeExecutionBackend:
             actor_id: str,
             value: tuple[PreparedActor, str],
         ) -> str | None:
-            prepared, _model_key = value
-            if await self.runtime.is_live(prepared):
+            lifecycle = self._actor_lifecycle_lock(actor_id)
+            if lifecycle.locked():
+                # A legitimate load may be slow. Defer this actor to the next
+                # heartbeat, not the heartbeat/renewals to the end of the load.
                 return None
-            try:
-                await self.runtime.evict(prepared, force=True)
-            except Exception:
-                # An ambiguous control-plane failure is not disposal proof.
+            async with lifecycle:
+                with self._prepared_lock:
+                    if self._prepared.get(actor_id) != value:
+                        # A completed switch rebound this ID while the probe
+                        # waited. Never dispose the successor using an old key.
+                        return None
+                prepared, _model_key = value
+                if await self.runtime.is_live(prepared):
+                    return None
+                try:
+                    await self.runtime.evict(prepared, force=True)
+                except Exception:
+                    # An ambiguous control-plane failure is not disposal proof.
+                    return None
+                with self._prepared_lock:
+                    if self._prepared.get(actor_id) == value:
+                        self._prepared.pop(actor_id, None)
+                        return actor_id
                 return None
-            with self._prepared_lock:
-                if self._prepared.get(actor_id) == value:
-                    self._prepared.pop(actor_id, None)
-                    return actor_id
-            return None
 
         results = await asyncio.gather(
             *(reconcile_one(actor_id, value) for actor_id, value in candidates)
@@ -1220,8 +1399,9 @@ class RuntimeExecutionBackend:
 
     def _resolve_registration(self, model: Mapping[str, Any]) -> ModelRegistration:
         return self.registry.resolve(
-            str(model["alias"]),
-            revision=_configured_wildcard(model.get("revision")),
+            str(model["repo_id"]),
+            revision=_optional_text(model.get("revision")),
+            subfolder=_optional_text(model.get("subfolder")),
             backend=_optional_text(model.get("backend")),
             backend_version=_optional_text(model.get("backend_version")),
             dtype=_optional_text(model.get("dtype")),
@@ -1389,7 +1569,7 @@ class RuntimeExecutionBackend:
                     )
                 continue
             logical_path = registration.logical_path
-            target = self.storage.resolve(f"{store.staging_prefix}/{logical_path}")
+            target = self.storage.resolve_writable(f"{store.staging_prefix}/{logical_path}")
             if source != target.resolve():
                 store.stage_file(source, logical_path)
             paths.add(logical_path)
@@ -1442,7 +1622,7 @@ class RuntimeExecutionBackend:
         # Checkpoints are self-contained recovery snapshots. Older snapshots
         # are not prerequisites for the newest one; uploading all of them can
         # turn completed remote work into days of redundant network traffic.
-        for checkpoint in (() if selected_checkpoint is None else (selected_checkpoint,)):
+        for checkpoint in () if selected_checkpoint is None else (selected_checkpoint,):
             if regional:
                 assert self.regional_state is not None
                 storage_reference = self.regional_state.reference_for(checkpoint)
@@ -1623,6 +1803,8 @@ def _decode_actor_identity(
 ) -> tuple[Mapping[str, Any], str]:
     raw_model = identity.get("model")
     if raw_model is None:
+        if "model" in identity:
+            raise ValueError("model-free runtimes cannot be recovered as warm actors")
         return identity, "legacy-runtime"
     model = _mapping(raw_model, "persisted actor model")
     runtime_fingerprint = str(identity.get("runtime_fingerprint") or "")
@@ -1638,11 +1820,6 @@ def _prepared_gpu_uuids(prepared: PreparedActor) -> set[str]:
     for key in prepared.group_keys or (prepared.key,):
         members.update(key.replica_gpu_uuids)
     return members
-
-
-def _configured_wildcard(value: Any) -> str | None:
-    text = _optional_text(value)
-    return None if text in {None, "configured"} else text
 
 
 def _checkpoint_interval(assignment: Assignment) -> float | None:

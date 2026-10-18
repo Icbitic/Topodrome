@@ -50,9 +50,9 @@ The following decisions are fixed for the first implementation:
 7. Model weights are managed independently by each site's model service. They
    are not distributed through Lab1's global filesystem.
 8. Lab1 provides the authoritative global experiment filesystem. Remote sites
-   access it through rclone/SFTP and a site-local cache. The default remote
-   adapter is a direct mirror that needs no FUSE; a full VFS mount remains an
-   optional deployment mode on hosts that support it.
+   access it through the enrolled-agent HTTP API and a verified site-local
+   mirror. Every file size, metadata query and directory listing uses HTTP;
+   no external transfer executable or filesystem mount is required.
 9. Every successfully committed job output is immediately addressable as an
    immutable global asset. A user may additionally publish a private or shared
    name and version; publication stores only a small manifest and never copies
@@ -83,6 +83,21 @@ The following decisions are fixed for the first implementation:
     adapter.
 
 ## 3. Major components
+
+Operator upgrade amendment (2026-10-02): code/configuration releases use a
+separate, single-writer updater and an immutable private release snapshot.
+Preparation does not pause dispatch. After preparation, an optional target/all
+admission pause drains only the requested scope; natural-idle mode leaves
+dispatch open until a final atomic idle claim. Every live change requires fresh
+generation-bound site inactivity plus no active leases/attempts/kernels, staging,
+pending required output/log delivery or conflicting provider operations. The
+claim shares the offer/kernel-admission lock, persists its fence before mutation,
+and never preempts work. Submissions remain accepted. The fsynced owner-private
+`.topodrome-upgrades` journal survives scheduler replacement; interrupted apply
+is fenced for explicit recovery rather than blindly replayed. Verified release
+or declared/verified rollback and fresh post-upgrade process identities precede
+resuming dispatch. See `topodrome/docs/IDLE_UPGRADES.md`. Ordinary scheduling-policy
+hot reload remains distinct and unchanged.
 
 ### 3.1 Central scheduler
 
@@ -128,13 +143,23 @@ provider audit records are retained.
 
 ### 3.2 Site agent
 
+Institutional suppliers explicitly removed by an operator retain a `retired`
+site tombstone rather than deleting their database row. Retirement requires
+offline, quiescent capacity with no active attempts, leases, physical claims,
+kernels or input staging, and revocation of the old enrollment/bootstrap
+configuration. Retired sites and their GPU/model inventory are excluded from
+active views and placement; a later heartbeat cannot revive a retired identity.
+Historical attempts, outputs, logs and reference metadata remain intact. A
+replacement physical server receives a fresh site identity and private mutable
+state, while it may reuse the same immutable model files and locked dependencies.
+
 Each site runs one asynchronous Python agent outside Ray. It maintains an
 outbound authenticated connection to the scheduler and is responsible for:
 
 - reporting a heartbeat and per-GPU NVML measurements;
 - detecting Topodrome-managed and foreign GPU processes;
 - reporting warm, cached, and obtainable model capabilities;
-- verifying the global rclone transport and local cache;
+- verifying the HTTP storage authority and local cache;
 - making the final local admission decision for a lease;
 - reserving exact physical GPU UUIDs;
 - starting or reconnecting to the site-local Ray cluster;
@@ -210,10 +235,26 @@ group has reserved every member.
 
 ### 3.4 Model runtime
 
+Checkpoint-sweep amendment (2026-10-18): a compatible idle Transformers worker may
+retain its process and ordered GPU set across exact model revisions. Physical
+admission first atomically claims the complete source replica for the new lease,
+checking exact source actor/model/PIDs and reclaimable VRAM. Persisted residency
+remains on the old identity in busy state until preparation succeeds. The worker
+checks functional config, runtime profile and complete tensor layout before any
+in-place write; local safetensors copies retain parameter storage and reset small
+model-dependent buffers/caches. Configuration/layout/hook differences reconstruct
+the model in that same compatible worker. Unsupported/private/distributed/adapter
+or changed-resource workers retain ordinary whole-replica disposal. A partial
+switch, changed ownership or unconfirmed cleanup never exposes the target model;
+claims remain fenced until exact disposal. No active previous job/kernel is a
+switch candidate. Exact-model warm reuse remains distinct from a revision switch
+for startup measurement. Restart mismatches fail closed through exact actor
+reconciliation rather than advertising the previous checkpoint against new bytes.
+
 A model actor owns the live framework model, tokenizer, CPU memory, GPU memory,
 and experiment hooks. An actor is keyed by at least:
 
-- model alias and exact revision;
+- registered repository ID, exact snapshot revision, and optional subfolder;
 - loader backend and backend version;
 - dtype or quantization mode;
 - adapter identity, when applicable;
@@ -260,6 +301,15 @@ and activation patches must be removed in a `finally` block or by runtime-level
 cleanup after every attempt. Adapter training receives exclusive ownership of
 its actor for the duration of training, and base weights remain immutable.
 
+Source imports are attempt-scoped as well: entrypoints, sibling helpers, and
+source packages must not inherit another attempt's `sys.modules` state. The
+source search path remains available through execution, async completion, and
+cleanup, then the runtime restores shadowed installed modules and removes
+attempt-owned import entries. Model/framework dependencies remain cached.
+Local actors serialize these process-global changes; separate Ray worker
+processes retain parallel execution. Experiment-created threads must finish
+before the attempt returns; this is import hygiene, not a hostile-code sandbox.
+
 ### 3.5 Client interfaces
 
 Topodrome exposes the same scheduler through:
@@ -282,7 +332,7 @@ interface is:
 topodrome.submit(
     entrypoint="experiments/label_heads.py",
     model={
-        "alias": "meta-llama-3-8b-instruct",
+        "repo_id": "meta-llama/Meta-Llama-3-8B-Instruct",
         "parallelism": {
             "mode": "model_sharded",
             "degree": 2,
@@ -320,7 +370,22 @@ runtime working directory is referenced only by its scheduler-owned
 receives either a verified local directory or Ray's content-addressed package
 URI; mutable HTTP or object-store working-directory URLs are rejected.
 
-Multi-GPU intent is never inferred from `resources.gpu`. The model requirement
+GPU batch jobs may explicitly use `model: null`. They retain the full experiment
+context but do not resolve/acquire/load a catalog model. Positive per-GPU peak
+`resources.min_vram_gb` is mandatory. `execution: single` (default) invokes the
+entrypoint once with the complete atomically admitted same-site GPU set;
+`execution: distributed` requires at least two GPUs and invokes one private
+worker per GPU. Context exposes actual worker-local PyTorch `device`/`devices`,
+`rank`, `world_size`, `local_rank` and `is_main_process`; each native rank sees
+only its own `cuda:0`. Model/tokenizer are `None`, not a fake model alias.
+Physical UUIDs establish CUDA visibility before worker imports. No transparent
+VRAM pooling or framework-specific launcher is implied. These workers are
+always private/disposable and are stopped before releasing their GPU ownership,
+including detached finalization; they never contribute empty warm actors to the
+retention floor. Agents advertise model-free support, and the scheduler fails
+closed for older agents. Existing model identities and wire shapes are preserved.
+
+For preloaded-model jobs, multi-GPU intent is never inferred from `resources.gpu`. The model requirement
 must explicitly select `distributed`/`ray_worker_group` or
 `model_sharded`/`transformers_device_map`, and its degree must equal the GPU
 resource count. The model-sharded per-GPU maximum may not exceed the physical
@@ -534,7 +599,7 @@ endpoint, provider, model revision/backend/path, or other runtime change rejects
 the entire candidate without exposing configuration values.
 
 A live-placement exception applies when changes are limited to
-`prefer_autodl_over_foreign_processes`, model startup-cost estimates, and/or
+`prefer_autodl_over_foreign_processes`, `preferred_site_ids`, model startup-cost estimates, and/or
 removing sites from `foreign_capacity_sharing_site_ids`. Narrowing this
 allowlist filters future offers only; it does not revoke existing leases.
 Per-site idle-timeout overrides also use this live exception because disposal
@@ -544,6 +609,48 @@ The next dispatch boundary durably activates that candidate without waiting for
 existing attempts, leases, or provider operations. Their identities and state
 remain unchanged; only subsequent placements use the new order. Institutional
 actor-maintenance cooldowns remain intact. Any other changed field still requires draining.
+
+Operators can set an ordered site preference live through
+`PUT /api/v1/policy/site-preference`, the `site-preference` CLI command, or the
+Sites detail actions in `top`. The request carries `expected_generation` so
+concurrent edits conflict instead of silently overwriting each other. Only
+registered, non-retired site IDs are accepted; offline preferences remain latent
+until eligible. An empty order restores automatic measured-cost placement.
+The order is persisted in the same atomic policy store and promoted while holding
+the placement/offer lock, without waiting for active jobs or rewriting leases.
+It is a rank within existing contention/cost bands, not affinity or an override
+of health, reservations, foreign-process exclusions, gang admission, or model
+compatibility. With an explicit order, ordinary and idle whole-replica replacement
+candidates share their contention band so warmth cannot defeat the operator's
+choice. A site without eligible capacity falls back immediately; all unlisted
+sites retain measured-cost ordering. Queue priority, fairness and starvation
+protection remain unchanged. Existing input-stage hysteresis remains in force;
+the edit does not forcibly retarget transfers already underway.
+Reloading YAML that omits `preferred_site_ids` preserves the live choice;
+an explicit value, including `[]`, deliberately replaces it.
+
+The workbench reorders directly in the existing Sites table, without a new tab
+or editing dialog. Arrows select; Space picks up the selected site and starts
+a captured draft. A visible `↕` marker and footer indicate that ordinary arrows
+now move that exact site. Space drops it so arrows select another site.
+Shift+arrows remain an optional direct shortcut, not a required terminal feature.
+The site's details also offer Reorder sites to pick it up and return to the
+table with mouse move/Auto/Save/Cancel controls. Enter saves once; Esc or leaving the
+tab discards an unsaved draft. A row click drops the picked-up site and selects
+the clicked row, never saving. Space and ordinary arrow overrides are scoped to
+the Sites table and do not intercept text entry, buttons, details, or modal
+controls. Starting a reorder clears the filter and captures all registered
+sites and the policy generation; background refresh updates metrics but cannot
+rewrite the draft. New sites remain unranked automatic fallbacks. Existing
+explicit ranks precede unranked sites; a reorder ranks the complete captured
+list. Offline sites remain visible and latent. Auto resets the draft order,
+but neither it nor a local move performs an API write before explicit Save.
+Unchanged drafts do not submit a mutation. A changed policy generation or
+removed draft target disables Save; server-side CAS also protects races after
+the last refresh. Conflicts require cancel/refresh/explicit retry, not blind
+replay. Disruptive management actions retain separate review and confirmation.
+This client-only change does not affect the placement bands or require a
+scheduler/site-agent restart.
 
 A valid changed candidate is first persisted, together with the still-active
 snapshot, in an owner-only atomic state file under the scheduler global root.
@@ -694,6 +801,19 @@ resources that never become eligible.
 
 ### 5.2 Job arrays and observed timings
 
+Array elements may override the complete `model` address and explicitly selected
+resource fields. Omission inherits the shared model; explicit null means model-free
+execution. Source/assets resolve once, while every child's registered model is
+independently pinned before the all-or-none submission transaction. Resource and
+parallelism checks apply to each child, including its own automatic model VRAM
+default. These remain independent ordinary jobs, not one long sweep lease.
+For an admitted array child, a bounded read-only queue lookahead may attach one
+other eligible child's exact model as an advisory hint. The site reads only its
+verified local weights through a site-wide bounded read-ahead pool, without CUDA,
+downloads, permanent copies, queue reordering or readiness claims. Application
+buffers, bytes, available-memory floor and a cooperative deadline bound this
+optional optimization; the kernel controls reclaimable file-cache residency.
+
 An array is a durable owner-scoped parent plus 1–1,000 independent ordinary jobs,
 not a multi-site gang or a new execution protocol. A shared `JobSpec` and bounded
 per-index kwargs expand at submission; immutable source/assets are resolved once
@@ -729,19 +849,14 @@ cancellation, never a retryable attempt failure; they do not cancel siblings.
 ## 6. Global experiment filesystem
 
 Most experiments operate under an authoritative filesystem hosted by Lab1.
-Lab1 accesses the storage through its native local path. AutoDL and remote
-Jupyter sites access the same logical namespace through rclone/SFTP and a
-site-local cache.
-
-The default remote mode is a direct mirror. It uses explicit rclone stat, copy,
-copy-to, move-to, and read-back operations and therefore does not require FUSE
-or `/dev/fuse`. A missing immutable source, asset member, artifact, or checkpoint
-is downloaded into a resumable local partial and atomically promoted into the
-cache after its remote identity is rechecked. New and modified output files
-remain local until the
-storage adapter performs the durability barrier described below. A full rclone
-VFS mount is still supported as an optional mode on a host with a working FUSE
-device.
+Lab1 accesses storage through its native local path. Remote AutoDL, Jupyter and
+SQZ sites use one authenticated HTTP transport and a verified site-local mirror.
+There is no protocol fallback or FUSE dependency. Persistent connections serve
+tiny files immediately; identity-fenced Range streams serve large files.
+Source trees use bounded standard ZIP wire envelopes when small, and paged
+HTTP metadata plus independently verified member streams otherwise.
+Missing immutable inputs are exposed only after local fsync, SHA-256 validation
+and atomic publication. New outputs remain local until the durability barrier.
 
 Every site maps its physical storage to a configured logical root, for example:
 
@@ -759,14 +874,20 @@ direct-mirror mode, `global_root` is the site-local cache root; it is not a
 second authoritative filesystem. Experiment code should resolve it through the
 Topodrome context or environment and must not hardcode a machine-specific path.
 
-Direct-mirror caches live on fast site-local disk and enforce a configured
-minimum-free-space floor before materialization. The adapter bounds every
-remote command, caches health probes briefly, rejects unsafe logical paths and
-unnamed or inline rclone remotes, and publishes through a unique remote
-temporary name. VFS deployments additionally configure cache size, write-back
-behavior, and mount health. The site agent reports storage unavailable and
-refuses new work when it cannot reach the Lab1 authority or safely use its
-cache.
+HTTP mirror caches live on fast site-local disk and enforce a configured
+minimum-free-space floor before materialization. Metadata, streams, prefix
+writes and health checks have bounded memory, concurrency and timeouts.
+Logical paths reject traversal, symlinks and special files. The agent reports
+storage unavailable and refuses new work when Lab1 or its local cache is unsafe.
+Whole-tree caches are separate from individual member caches: the presence of
+one child never proves a complete directory has been materialized.
+
+Storage separates read materialization (`resolve`) from canonical local write
+locations (`resolve_writable`). Attempt workspaces, logs, checkpoints, staging
+and manifest writers use the latter; it never downloads a remote job tree or
+returns an immutable directory-cache view. The same canonical paths feed
+`flush_and_verify`. Writable paths reject symlink aliases and special files;
+retrying a job must not relocate its new attempt under a previous input cache.
 
 Source-upload admission is an immutable member of the active scheduler policy
 generation. Updated clients discover it before reading and base64-encoding a
@@ -799,23 +920,87 @@ Large temporary data is written to site-local scratch space. An experiment must
 reduce, summarize, or explicitly export it before the attempt is considered
 portable.
 
-Closing a local cache file or a file on an rclone mount does not by itself prove
-that the data is durable on Lab1. The storage adapter must provide a
-`flush_and_verify` operation. In direct-mirror mode this synchronizes the local
-file, uploads it under a unique temporary name, promotes it to its final remote
-path, then independently reads and hashes the authoritative bytes. An attempt
-is marked complete only after its required outputs and portable checkpoints
-have passed that barrier.
+Closing a local cache file does not prove Lab1 durability. The mirror's
+`flush_and_verify` first synchronizes and hashes local bytes. HTTP uploads
+journal the exact source digest, destination and owned private prefix before
+sending. Checksummed contiguous extents start at 128 KiB and adapt toward two
+seconds of transfer, never exceeding 8 MiB. ACKs follow authority file and
+directory fsync. After restart, the stored prefix and local source prefix must
+match in size and independently observed SHA-256 before resume. Whole-file
+verification precedes exact-sibling atomic publication; final independent
+verification precedes receipt retirement and scheduler completion. Lost ACKs
+recover idempotently without resending a verified complete output.
+Immutable payloads reject conflicting replacement; current manifest pointers
+retain the existing fenced-client semantics. These enrolled-agent byte APIs
+are not user authorization or job-completion authority.
 
-When `rclone.verification_via_scheduler` is enabled, the remote must map to the
-scheduler's authoritative global root. After promotion the enrolled site sends
-a small authenticated digest request; Lab1 reads, fsyncs and hashes its own file
-and returns only size and SHA-256. This avoids downloading the uploaded payload
-back to the producing site. Hashing is bounded to two concurrent requests and
-rejects symlinks, unsafe paths, non-regular files and detected modification.
-An unavailable verifier fails closed; it never trusts the local cache or an
-upload-provided checksum. AutoDL bootstrap bundles always enable this path for
-their Lab1 global mirror. Other rclone authorities retain direct read-back.
+Authority-local digest requests return size and SHA-256 without downloading
+outputs back to expensive compute. Bounded hash capacity rejects unsafe paths
+and detected modifications; an unavailable verifier fails closed.
+Bulk downloads require exact Range/Content-Range, Content-Length and If-Match
+opaque source identity. Their complete bytes must match an accepted content pin
+or independent authority digest before atomic cache publication. Unknown or
+changed identities, corrupt bytes and ignored range requests cannot become
+visible. Prefixes and pending results remain protected through recovery.
+
+The default immediate threshold is 1 MiB (`storage.small_file_max_bytes`, hard
+ceiling 4 MiB; zero uses HTTP streams for every file). Eight persistent
+short-request connections and independent server I/O slots avoid process,
+handshake and batching delays. Small source envelopes verify the original
+manifest, exact regular member set and every checksum before publication;
+they are not stored as another archive. HTTP keepalive defaults to 300 seconds.
+
+Bulk HTTP streams/prefix writes have separate bounded pools and server slots.
+For SSH-routed deployments, a second independently owned local forward is
+mandatory (`bulk_ssh_local_forward`, `storage.bulk_url`): separate ports,
+state directories and outer TCP connections, with ControlMaster reuse disabled.
+Both routes reach the same authority. They are checked every five seconds;
+a failed bulk route does not tear down healthy control. Physical link capacity
+and disk contention remain shared; this does not promise a latency SLA.
+
+Opt-in `storage.bulk_reconnect` measures sustained slow bulk traffic using a
+second explicitly configured, pinned loopback SSH slot. A fresh route is
+accepted only after bounded, integrity-checked bidirectional link probes show
+an improvement (or verify recovery from an unavailable old link). Existing
+HTTP streams drain on their original generation; durable upload extents and
+verified download prefixes retain their normal resume semantics. At most two
+owned generations exist, failed attempts observe cooldown, and control/jobs/
+actors are untouched. Reconnection does not guarantee a different network
+route. See `topodrome/docs/HTTP_TRANSPORT.md` for limits and configuration.
+
+At most three recognized link-recovery attempts re-enter verified partial/
+receipt recovery under one total deadline. Authentication, integrity, caller
+cancellation, expired publication authority and disk failures never downgrade
+or retry blindly. The mirror owns pins, exact-path locks, capacity accounting
+and durability; HTTP owns byte transport. Native Lab1 access is unchanged.
+
+HTTP upload extents may negotiate independent level-1 gzip bodies through
+`Accept-Encoding` response headers. Only useful compression is selected; raw
+SHA-256, offsets, acknowledgements and blobs remain unchanged. The authority
+bounds encoded and decoded lengths, verifies a complete single gzip member and
+its decoded checksum before writing, and rejects corruption without protocol
+downgrade. Prefix metadata/publication has capacity separate from slow upload
+body reception, preserving status/resume access under WAN loss. See
+`topodrome/docs/HTTP_TRANSPORT.md` for limits and validation.
+AutoDL's stdlib-only bootstrap seed helper uses the same HTTP read protocol and
+protected enrollment before dependency installation. The bundle requires uv,
+not external transfer commands. SSH remains for tunnels and scoped remote administration.
+
+An authenticated GET returns exact bounded bytes and a SHA-256 ETag. Pinned inputs
+check the expected size/hash before local fsync and atomic cache exposure, without
+separate remote-stat round trips. PUT atomically receives, verifies and commits
+one output, returning the authority-observed size/hash only after file/namespace
+fsync. Blob publication folds its durable claim into this same request before
+payload publication and is serialized with blob GC. Output authority is checked
+before reception and again under job/attempt/lease locks at local commit; no
+network reception holds those locks. Terminal log-outbox delivery remains allowed
+for the exact originating site/attempt. Immutable files reject conflicting retries;
+only the current job publication pointer may replace prior bytes. Symlinks, special
+files, unsafe paths, unowned writes, expired leases and malformed uploads fail
+closed. Only unsupported endpoints/ineligible objects downgrade to the bulk path,
+never authentication, integrity or authority failures. A lost acknowledgement is
+not success; a byte-identical retry is safe. No schema or storage-layout change is
+required. Reverse proxies must preserve comparable upstream keepalive settings.
 
 Checkpoint snapshots are self-contained: finalization
 verifies only the newest snapshot, not every superseded snapshot. Retention
@@ -886,6 +1071,15 @@ other references and artifact retention continue to protect payloads until they
 independently expire. No undelete or forced payload-purge operation is exposed.
 
 Editable optional tags live in separate atomically replaced `tags.json` metadata.
+Asset listings default to the latest nondeleted publication per visibility/name
+in the caller's authorized namespace. Selection uses publication time with a
+deterministic reference tie-break, before tag filtering and limiting. The API
+and SDK `all_versions` option and CLI `--all-versions` expose prior versions
+without changing storage or immutable input pins. The workbench groups history
+under each latest asset row: Space/disclosure expands it independently, and
+Enter opens the exact version. It fetches only metadata on expansion, bounds
+history to 1,000 returned versions with explicit truncation/loading/error states,
+and preserves exact-reference details and selection through refresh/collapse.
 `PATCH /api/v1/assets/{name}/{version}/tags` applies set additions/removals under
 the same authorization and lock. At most 32 normalized lowercase tags of 1–64
 ASCII letters/digits or `_ . : / -` are allowed. Repeated `tag` filters on the
@@ -916,18 +1110,40 @@ publication may leave an unreferenced payload for operator recovery, never a
 catalog entry pointing at deliberately deleted bytes. Editing means publishing
 a new version from a local copy, not mutating an existing pin.
 
-Named assets can also be downloaded without creating a job or acquiring a GPU.
-`asset-download NAME VERSION DESTINATION` and both SDKs fetch authenticated
-catalog metadata, then stream exact members from
-`GET /api/v1/assets/{name}/{version}/files/{member-index}`. Each request checks
-private/shared access before opening a descriptor beneath the authoritative
-root, refusing symlinks and wrong-size/non-regular files. Bodies are chunked;
-responses are private/no-store and descriptors close on completion/disconnect.
-Clients stage a separate editable copy, verify every member size and SHA-256,
-and publish it only to a new destination. Existing destinations are not
-overwritten. Failure cleans incomplete staging; retry restarts from byte zero.
-Both uploaded and job-published origins use this path, completing the
-download/local-edit/new-version-upload workflow independently of GPU scheduling.
+`topodrome download REFERENCE DESTINATION` and both SDKs' `download` method
+retrieve either a `job://JOB_ID/path` file/tree or an exact
+`asset://private|shared/name@version` without creating a job, acquiring a GPU,
+or registering an asset. Only durable succeeded-job outputs are exposed;
+job ownership and private/shared catalog permissions are checked before
+resolving exact immutable members. Public metadata never includes authority
+filesystem or blob paths. Upload and job-published assets use the same engine.
+
+`POST /api/v1/downloads` creates an owner-bound, fsynced reference beneath
+`.topodrome-downloads`. Creation, renewal, closing and GC share the storage
+serialization boundary; active download members survive artifact expiry and
+asset deletion without a permanent asset reference. References expire after
+15 minutes without renewal, with an absolute 24-hour lifetime. The client
+renews every minute, including during local I/O; active server streams renew
+too. Expired references no longer pin bytes, and a new download prunes expired
+metadata. Admission is bounded to 16 live references per owner, 128 overall,
+10,000 members and 16 MiB of metadata per reference. Corrupt pin metadata makes
+collection fail closed. Clients close references on completion/error; process
+death releases protection by expiry. Restarting the scheduler preserves live pins.
+
+Authenticated `GET /api/v1/downloads/{download-id}/files/{member-index}` reads
+descriptor-pinned regular files beneath the authority, refusing symlinks and
+size changes. Open-ended byte ranges, SHA-256 ETags and If-Match permit resume
+without accepting changed content. Responses are private/no-store. Client
+copies stream through a destination-specific, owner-private staging tree,
+locked against concurrent transfers and bound to the server/ref/manifest.
+Retrying the same URI and destination rehashes the existing prefix, resumes
+missing bytes and verifies every completed member's exact size/SHA-256 before
+atomic exposure at a new destination. Existing files are never overwritten;
+failed/canceled transfers retain partials for retry, while success removes
+staging. Editing changes only the local copy. Downloads do not extend ordinary
+retention beyond their live transfer pin; a permanent asset still requires
+explicit publication. The older named `asset-download` interface remains
+available but is not the resumable unified interface.
 
 The site stages asset inputs only after placement and before model preparation.
 Local authoritative files become a read-only, content-addressed view without a
@@ -947,6 +1163,20 @@ explicit artifact commit. Model weights remain under the separate model-cache
 policy in Section 8.
 
 ## 8. Model storage
+
+Model addresses consist of a registered `repo_id` (`owner/repository`), an exact
+`revision`, and optional `subfolder`. The catalogue's default or registered ref
+labels are pinned before submission commits; explicit unknown selections are
+rejected, never replaced by default weights. Additional operator-registered
+snapshots support checkpoint experiments through ordinary jobs/arrays. Local
+logical repositories need not be uploaded to HF. HF acquisition uses full commit
+IDs, never moving branch labels. All actor/capability/placement identities include
+the subfolder. Old aliases are replaced, not maintained as a compatibility layer.
+Model discovery exposes registered ref labels and the default-snapshot marker
+alongside per-site immutable capabilities, with exact repository filtering.
+This metadata comes from the scheduler's catalogue, joined by repository, commit
+and subfolder; discovery performs no Hub lookup and exposes no private locations.
+See `topodrome/docs/MODEL_ADDRESSES.md` for catalogue and manifest examples.
 
 The cross-site production catalog supports Meta-Llama-3-8B-Instruct,
 Gemma-3-12B-it, OLMo-2-1124-7B-Instruct, and Qwen3-4B-Instruct-2507.
@@ -1041,8 +1271,8 @@ Active computation uses `/root/autodl-tmp` or another fast local disk. The site
 agent stages model weights from `/root/autodl-fs` to local disk before loading
 them when local I/O is materially faster.
 
-The Lab1 global filesystem is accessed separately through the no-FUSE rclone
-mirror by default. Its cache belongs on `/root/autodl-tmp`, not on the limited
+The Lab1 global filesystem is accessed separately through the verified HTTP
+mirror. Its cache belongs on `/root/autodl-tmp`, not on the limited
 regional filesystem. Lab1 remains the authoritative location for normal
 experiment code, immutable global assets, notebooks, portable checkpoints, and compact
 final results.
@@ -1124,7 +1354,7 @@ A representative request is:
 
 ```python
 topodrome.kernel(
-    model="llama3.1-8b-it",
+    model="meta-llama/Meta-Llama-3-8B-Instruct",
     resources={"gpu": 1},
     mode="raw-model",
 )
@@ -1299,6 +1529,14 @@ when unused.
 Multiple clients may submit concurrently. The central queue, PostgreSQL leases,
 and fencing tokens prevent duplicate ownership.
 
+Inventory updates, offer creation, and reservation creation lock the site row
+before physical GPU rows (gang rows in UUID order). This prevents heartbeat
+replacement of GPU inventory from deadlocking with child-row foreign-key checks.
+An offer proven unsent by the exact-generation control registry is withdrawn
+transactionally and requeued immediately, retaining valid staged inputs and the
+job's failure budget. A send exception is ambiguous: its claims remain fenced
+until acceptance or normal expiry. Recovery never revokes an accepted attempt.
+
 Within one model actor, mutating experiments run sequentially. Independent GPUs
 may host separate actors for concurrent work. Multi-GPU training acquires all
 required GPU leases atomically before creating its Ray worker group.
@@ -1339,13 +1577,12 @@ expiry. Service-backed notebooks may share the ordinary actor queue.
   users to choose the same client key independently.
 - Site agents use individual enrollment identities and authenticated outbound
   connections.
-- Each remote site uses a separate storage-only SSH identity. Its private key,
-  pinned known-hosts file, and named rclone configuration are owner-only and
-  never reused for the scheduler control tunnel. Lab1 confines that public key
-  to the exact authoritative global root with a forced SFTP-serving command;
-  it grants neither a shell nor port forwarding. Inline rclone connection
-  strings are rejected so credentials cannot enter site YAML or process
-  arguments.
+- Remote storage HTTP uses site enrollment, never ordinary-user credentials.
+  Plaintext endpoints must be explicit loopback routes inside pinned SSH
+  forwards; non-loopback endpoints require TLS. Dedicated forward-capable
+  site keys permit only the scheduler's loopback endpoint and are never
+  personal login keys. Restrict them to the scheduler's exact forwarding endpoint.
+  Credentials stay in owner-only files and request headers, never URLs or argv.
 - Lease tokens are short-lived and scoped to one attempt.
 - Direct kernel-relay URLs are short-lived and generation-revocable. Managed
   IDE server credentials remain stable only while their session/process and
@@ -1433,6 +1670,22 @@ must be rotated before they are used for implementation testing.
 
 ## 15. Command-line surface
 
+The System workbench tab consumes operator-only `GET /api/v1/system` diagnostics.
+Storage telemetry is a single-flight, five-minute background sample with a
+20-second / 250,000-entry cooperative scan budget and a 50,000-row-per-table
+diagnostic metadata cap. It counts allocated regular-file bytes by unique inode
+within the active central root, excluding symlinks/submounts. External databases,
+remote caches/models and archived stores outside that root are out of scope.
+Filesystem free space is explicitly host-wide, not Topodrome-only.
+Cleanup estimates reuse the authoritative reference-aware eligibility planner
+at the sample time and +24 hours, using a read-only blob-index snapshot. Viewing
+does not initialize an index, hash payloads, acquire the publication/GC write
+lock, or delete files. Shared hardlinks only count as reclaimable if all links
+are eligible. Estimates assume unchanged references, do not override GC budgets
+or disabled maintenance, and never authorize deletion; actual GC still rechecks
+under its existing locks. Sampling failure retains labeled stale usage; unknown
+eligibility is not zero. Runtime health is refreshed independently of disk scans.
+
 Interactive terminals use an optional Textual workbench for `top`; `--once`
 retains the plain snapshot and `--plain` the legacy monitor. The workbench is an
 API client, never an alternate authority: confirmed actions use the existing
@@ -1444,7 +1697,7 @@ Jupyter-server controls and does not change dispatch, leases, or site liveness.
 The interactive surface is a human management console: job submission and asset
 mutation stay in the agent-facing CLI/SDK. Its write actions are confirmed GPU
 reservations, reservation extension/cancellation, manual AutoDL registration/release/removal,
-and policy reload. Page-local actions use the same SDK endpoints, with no direct
+live site preference, and policy reload. Page-local actions use the same SDK endpoints, with no direct
 database or shell administration. The command palette is temporarily removed;
 storage cleanup remains a CLI operation. Forms require a separate review and
 confirmation step, and detail pages render curated fields, never raw API dumps.
@@ -1618,6 +1871,9 @@ the detached `committing` transition, agent restart recovers **upload-only** aut
 for that exact attempt. It does not reload a model or repeat user code. Transport
 failures retry with bounded exponential backoff (1–30 seconds); completed remote
 files are independently verified and reused rather than uploaded again.
+Untyped local filesystem failures (including missing files and denied access)
+are not network retries: they take the normal diagnostic failure path while
+preserving completed output/recovery receipts.
 
 Expired detached leases pause I/O and have a configurable recovery grace
 (`finalization_recovery_grace_seconds`, default 24 hours). Recovery requires the
@@ -1677,9 +1933,9 @@ These settings live under `scheduling.input_placement`; schema revision is
 `0017_adaptive_inputs`. Only authenticated, non-replayed state transitions train
 attempt costs. No user code, arguments or credentials are stored in measurement keys.
 
-Owned rclone processes, transfer-lock waits, and streaming hash loops honor explicit
-cancellation. The process handle is retained and reaped; foreign PIDs are never
-signaled. Failed/canceled computation releases its GPU without waiting for remote
+HTTP streams, transfer-lock waits, and streaming hash loops honor explicit
+cancellation. Owned SSH tunnels are supervised independently of requests; foreign
+PIDs are never signaled. Failed/canceled computation releases its GPU without waiting for remote
 log storage: a separate private, fsynced log outbox retries upload and authoritative
 registration. `log_complete` stays false until verified. Logs and finalizer receipts
 count as pending I/O for provider idle shutdown and graceful release.
@@ -1738,7 +1994,7 @@ Agents implementing Topodrome must preserve these invariants:
 3. Do not expose Ray ports as the cross-site public API.
 4. Do not put model weights in the Lab1 global experiment filesystem.
 5. Do not store large binary artifacts in PostgreSQL.
-6. Do not mark an rclone-backed output durable until it has been flushed and
+6. Do not mark a remote-backed output durable until it has been flushed and
    verified.
 7. Do not release an AutoDL instance until required local state is durable.
 8. Never rent, power on, or replace AutoDL capacity automatically. Only explicitly
@@ -1792,7 +2048,7 @@ The first complete implementation is accepted when it can demonstrate:
   never evicts after cancellation/expiry, and drives later unplaceable demand
   through the ordinary AutoDL fallback;
 - execution from a terminal-only Jupyter site through an outbound agent;
-- use of the Lab1 global filesystem through an rclone local cache;
+- use of the Lab1 global filesystem through a verified HTTP mirror;
 - direct and named private/shared assets pinned before dispatch;
 - multi-GiB asset members downloaded only on first remote use, resumed safely
   after interruption, and reused without a second payload copy;

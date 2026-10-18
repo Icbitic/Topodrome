@@ -266,7 +266,7 @@ def test_kernel_cli_preserves_single_gpu_default(monkeypatch: Any) -> None:
     _KernelClient.request = None
     monkeypatch.setattr(cli, "Client", _KernelClient)
 
-    result = CliRunner().invoke(cli.app, ["kernel", "--model", "model-a"])
+    result = CliRunner().invoke(cli.app, ["kernel", "--model", "test/model-a"])
 
     assert result.exit_code == 0, result.output
     request = _KernelClient.request
@@ -284,7 +284,7 @@ def test_kernel_cli_constructs_explicit_model_sharded_gang(monkeypatch: Any) -> 
         [
             "kernel",
             "--model",
-            "model-a",
+            "test/model-a",
             "--gpus",
             "2",
             "--min-vram-gb",
@@ -310,7 +310,7 @@ def test_kernel_cli_requires_sharding_memory_for_multiple_gpus(monkeypatch: Any)
 
     result = CliRunner().invoke(
         cli.app,
-        ["kernel", "--model", "model-a", "--gpus", "2"],
+        ["kernel", "--model", "test/model-a", "--gpus", "2"],
     )
 
     assert result.exit_code != 0
@@ -325,7 +325,7 @@ def test_kernel_cli_rejects_sharding_memory_for_one_gpu(monkeypatch: Any) -> Non
         [
             "kernel",
             "--model",
-            "model-a",
+            "test/model-a",
             "--max-memory-per-gpu",
             "10",
         ],

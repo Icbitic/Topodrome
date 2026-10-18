@@ -11,7 +11,15 @@ from typing import Annotated, Any, Literal
 from urllib.parse import unquote
 from uuid import uuid4
 
-from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import (
+    AwareDatetime,
+    BaseModel,
+    ConfigDict,
+    Field,
+    field_validator,
+    model_serializer,
+    model_validator,
+)
 
 from topodrome.domain.enums import (
     AttemptState,
@@ -24,6 +32,12 @@ from topodrome.domain.enums import (
     SiteKind,
     SiteState,
     WorkloadKind,
+)
+from topodrome.domain.model_address import (
+    normalize_model_address,
+    validate_repo_id,
+    validate_revision,
+    validate_subfolder,
 )
 from topodrome.runtime_references import (
     validate_job_working_dir_reference,
@@ -193,14 +207,28 @@ ModelParallelism = Annotated[
 
 
 class ModelRequirement(StrictModel):
-    alias: str = Field(min_length=1, max_length=200)
-    revision: str = Field(default="configured", min_length=1, max_length=200)
+    repo_id: str = Field(min_length=1, max_length=200)
+    revision: str | None = Field(default=None, min_length=1, max_length=200)
+    subfolder: str | None = Field(default=None, max_length=500)
     backend: str = Field(default="transformers", min_length=1, max_length=100)
     backend_version: str | None = Field(default=None, max_length=100)
     dtype: str = Field(default="bfloat16", max_length=50)
     quantization: str | None = Field(default=None, max_length=100)
     adapter: str | None = Field(default=None, max_length=500)
     parallelism: ModelParallelism = Field(default_factory=SingleGPUParallelism)
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_address(cls, value: Any) -> Any:
+        return normalize_model_address(value)
+
+    _valid_repo = field_validator("repo_id")(validate_repo_id)
+    _valid_subfolder = field_validator("subfolder")(validate_subfolder)
+
+    @field_validator("revision")
+    @classmethod
+    def valid_revision(cls, value: str | None) -> str | None:
+        return None if value is None else validate_revision(value)
 
 
 class ResourceRequirements(StrictModel):
@@ -291,7 +319,8 @@ class JobSpec(StrictModel):
     description: str | None = Field(default=None, max_length=4000)
     entrypoint: str = Field(min_length=1, max_length=1000)
     source_ref: str | None = Field(default=None, max_length=500)
-    model: ModelRequirement
+    model: ModelRequirement | None
+    execution: Literal["single", "distributed"] | None = None
     assets: dict[str, AssetRef] = Field(default_factory=dict)
     resources: ResourceRequirements = Field(default_factory=ResourceRequirements)
     kwargs: dict[str, Any] = Field(default_factory=dict)
@@ -322,7 +351,7 @@ class JobSpec(StrictModel):
     @field_validator("model", mode="before")
     @classmethod
     def parse_model(cls, value: Any) -> Any:
-        return {"alias": value} if isinstance(value, str) else value
+        return normalize_model_address(value)
 
     @field_validator("assets", mode="before")
     @classmethod
@@ -360,13 +389,39 @@ class JobSpec(StrictModel):
             raise ValueError("region-affine jobs require affinity_region")
         if self.workload_kind is WorkloadKind.ADAPTER_TRAINING and self.resources.gpu < 1:
             raise ValueError("adapter training requires a GPU")
-        _validate_parallelism_resources(self.model, self.resources)
+        if self.model is None:
+            if self.workload_kind is not WorkloadKind.BATCH:
+                raise ValueError("model: null is supported only for batch GPU jobs")
+            if self.resources.gpu_count < 1:
+                raise ValueError("model-free jobs require at least one GPU")
+            if self.resources.min_vram_gb <= 0:
+                raise ValueError("model-free jobs require an explicit positive per-GPU min_vram_gb")
+            if self.execution == "distributed" and self.resources.gpu_count < 2:
+                raise ValueError("distributed execution requires at least two GPUs")
+        else:
+            if self.execution is not None:
+                raise ValueError("preloaded-model jobs use model.parallelism, not execution")
+            _validate_parallelism_resources(self.model, self.resources)
         if _job_kwargs_contain_credentials(self.kwargs):
             raise ValueError("credentials cannot be persisted in job kwargs")
         for alias in self.assets:
             if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,199}", alias) is None:
                 raise ValueError("asset aliases must be safe single path components")
         return self
+
+    @model_serializer(mode="wrap")
+    def serialize_execution(self, handler: Any) -> dict[str, Any]:
+        # Preserve the wire shape and idempotency identity of existing jobs.
+        payload: dict[str, Any] = handler(self)
+        if self.execution is None:
+            payload.pop("execution", None)
+        return payload
+
+    @property
+    def execution_mode(self) -> str:
+        if self.model is not None:
+            return self.model.parallelism.mode
+        return self.execution or "single"
 
     @property
     def runtime_fingerprint(self) -> str:
@@ -379,7 +434,11 @@ class JobSpec(StrictModel):
             "cpu": format(self.resources.cpu, ".12g"),
             "memory_bytes": round(self.resources.memory_gb * 1024**3),
             "gpu_count": self.resources.gpu_count,
-            "model_parallelism": self.model.parallelism.model_dump(mode="json"),
+            "model_parallelism": (
+                self.model.parallelism.model_dump(mode="json")
+                if self.model is not None
+                else {"model": None, "execution": self.execution_mode}
+            ),
         }
         encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
         return hashlib.sha256(encoded).hexdigest()
@@ -471,8 +530,9 @@ class GPUReservationSummary(StrictModel):
 
 
 class ModelCapability(StrictModel):
-    alias: str
+    repo_id: str
     revision: str
+    subfolder: str | None = None
     backend: str
     backend_version: str
     dtype: str
@@ -492,6 +552,10 @@ class ModelCapability(StrictModel):
     # receipt time, so central actor expiry survives scheduler restarts.
     idle_since: datetime | None = None
     verified_at: datetime = Field(default_factory=utc_now)
+
+    _valid_repo = field_validator("repo_id")(validate_repo_id)
+    _valid_revision = field_validator("revision")(validate_revision)
+    _valid_subfolder = field_validator("subfolder")(validate_subfolder)
 
     @model_validator(mode="after")
     def validate_replica_membership(self) -> ModelCapability:
@@ -516,8 +580,9 @@ class ModelCapability(StrictModel):
 
     def identity_tuple(self) -> tuple[str | None, ...]:
         return (
-            self.alias,
+            self.repo_id,
             self.revision,
+            self.subfolder,
             self.backend,
             self.backend_version,
             self.dtype,
@@ -536,6 +601,7 @@ class SiteHeartbeat(StrictModel):
     models: tuple[ModelCapability, ...] = ()
     cached_assets: set[str] = Field(default_factory=set)
     supported_workloads: set[WorkloadKind] = Field(default_factory=lambda: set(WorkloadKind))
+    supports_model_free: bool = False
     storage_available: bool = True
     storage_authoritative: bool = False
     queue_depth: int = Field(default=0, ge=0)
@@ -552,6 +618,7 @@ class SiteHeartbeat(StrictModel):
     interactive_kernel_active: bool = False
     artifact_flush_pending: bool = False
     staging_operation_active: bool = False
+    idle_compute_requested: bool = False
     sent_at: datetime = Field(default_factory=utc_now)
 
     @field_validator("cached_assets")
@@ -603,9 +670,19 @@ class AssignmentOffer(StrictModel):
     # idle Topodrome actors. The site still atomically proves and fences every
     # complete source replica before admitting this exact target lease.
     replace_idle_actors: bool = False
+    next_model: ModelRequirement | None = None
+
+    @model_serializer(mode="wrap")
+    def serialize_hint(self, handler):
+        value = handler(self)
+        if self.next_model is None:
+            value.pop("next_model", None)
+        return value
 
     @model_validator(mode="after")
     def validate_claims(self) -> AssignmentOffer:
+        if self.next_model is not None and self.next_model.revision is None:
+            raise ValueError("checkpoint read-ahead requires an exact pinned model revision")
         claim_uuids = tuple(claim.gpu_uuid for claim in self.claims)
         if len(set(claim_uuids)) != len(claim_uuids):
             raise ValueError("assignment claims must name unique GPU UUIDs")
@@ -719,7 +796,7 @@ class KernelRequest(StrictModel):
     @field_validator("model", mode="before")
     @classmethod
     def parse_model(cls, value: Any) -> Any:
-        return {"alias": value} if isinstance(value, str) else value
+        return normalize_model_address(value)
 
     @model_validator(mode="after")
     def require_raw_gpu(self) -> KernelRequest:

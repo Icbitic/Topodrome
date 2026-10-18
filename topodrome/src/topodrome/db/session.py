@@ -16,7 +16,7 @@ from topodrome.db.models import Base
 # Update this alongside every new Alembic head. Production readiness uses the
 # revision as a deployment contract instead of accepting a merely reachable,
 # empty, or stale database.
-CURRENT_SCHEMA_REVISION = "0019_remove_db_legacies"
+CURRENT_SCHEMA_REVISION = "0020_repository_models"
 
 
 class Database:

@@ -102,9 +102,12 @@ class _IdleActorGroup:
 
 def model_matches(capability: ModelCapability, spec: JobSpec) -> bool:
     wanted = spec.model
+    if wanted is None:
+        return False
     return (
-        capability.alias == wanted.alias
-        and (wanted.revision == "configured" or capability.revision == wanted.revision)
+        capability.repo_id == wanted.repo_id
+        and (wanted.revision is None or capability.revision == wanted.revision)
+        and capability.subfolder == wanted.subfolder
         and capability.backend == wanted.backend
         and (wanted.backend_version is None or capability.backend_version == wanted.backend_version)
         and capability.dtype == wanted.dtype
@@ -127,6 +130,7 @@ def choose_placement(
     allow_idle_actor_replacement: bool = False,
     prefer_autodl_over_foreign_processes: bool = False,
     remaining_seconds_by_site: Mapping[str, float] | None = None,
+    preferred_site_ids: tuple[str, ...] = (),
 ) -> Placement | None:
     """Choose one atomic placement using strict contention/cost bands.
 
@@ -246,11 +250,23 @@ def choose_placement(
             heavily_contended,
             heavy_replacements,
         )
+    if preferred_site_ids:
+        # Warmth/replacement cost must not defeat an explicit site choice.
+        # Only complete idle replicas are eligible for these replacements.
+        light = lightly_contended + light_replacements
+        middle = (
+            (autodl_placements, light)
+            if prefer_autodl_over_foreign_processes
+            else (light, autodl_placements)
+        )
+        bands = (clean + clean_replacements, *middle, heavily_contended + heavy_replacements)
+    site_ranks = {site_id: rank for rank, site_id in enumerate(preferred_site_ids)}
     for band in bands:
         if band:
             return max(
                 band,
                 key=lambda placement: (
+                    -site_ranks.get(placement.site_id, len(site_ranks)),
                     placement.fast_gpu_class,
                     -placement.idle_actor_replacement_gpu_count,
                     -(remaining_seconds_by_site or {}).get(
@@ -286,6 +302,8 @@ def _eligible_placements(
             continue
         if spec.workload_kind.value not in site.supported_workloads:
             continue
+        if spec.model is None and "model_free" not in site.supported_workloads:
+            continue
         if spec.affinity_site_id and spec.affinity_site_id != site.site_id:
             continue
         if spec.affinity_region and spec.affinity_region != site.region:
@@ -307,11 +325,12 @@ def _eligible_placements(
         )
 
         capabilities = [capability for capability in site.models if model_matches(capability, spec)]
-        if not capabilities:
+        if spec.model is not None and not capabilities:
             continue
-        parallelism_mode = spec.model.parallelism.mode
+        parallelism_mode = spec.execution_mode
         private_actor = (
-            parallelism_mode == "distributed"
+            spec.model is None
+            or parallelism_mode == "distributed"
             or spec.workload_kind is WorkloadKind.ADAPTER_TRAINING
             or (
                 spec.workload_kind is WorkloadKind.INTERACTIVE
@@ -327,6 +346,7 @@ def _eligible_placements(
                 )
                 for capability in capabilities
             ),
+            default=ModelAvailability.CACHED,
             key=lambda state: {
                 ModelAvailability.WARM: 0,
                 ModelAvailability.CACHED: 1,
@@ -511,7 +531,9 @@ def _eligible_placements(
             else startup_seconds_by_site.get(
                 site.site_id,
                 (
-                    _DEFAULT_CACHED_STARTUP_SECONDS
+                    0.0
+                    if spec.model is None
+                    else _DEFAULT_CACHED_STARTUP_SECONDS
                     if availability is ModelAvailability.CACHED
                     else _DEFAULT_OBTAINABLE_STARTUP_SECONDS
                 ),
@@ -559,7 +581,7 @@ def _eligible_placements(
 
 
 def _actor_matches_spec(key_data: dict[str, object] | None, spec: JobSpec) -> bool:
-    if key_data is None:
+    if key_data is None or spec.model is None:
         return False
     parallelism = spec.model.parallelism
     replica_members = _replica_members(key_data)
@@ -583,14 +605,15 @@ def _actor_matches_spec(key_data: dict[str, object] | None, spec: JobSpec) -> bo
         return False
     wanted = spec.model
     expected: dict[str, object] = {
-        "alias": wanted.alias,
+        "repo_id": wanted.repo_id,
+        "subfolder": wanted.subfolder,
         "backend": wanted.backend,
         "dtype": wanted.dtype,
         "quantization": wanted.quantization,
         "adapter": wanted.adapter,
         "runtime_fingerprint": spec.runtime_fingerprint,
     }
-    if wanted.revision != "configured":
+    if wanted.revision is not None:
         expected["revision"] = wanted.revision
     if wanted.backend_version is not None:
         expected["backend_version"] = wanted.backend_version
@@ -672,8 +695,9 @@ def _actor_model_identity(
     return tuple(
         key_data.get(key)
         for key in (
-            "alias",
+            "repo_id",
             "revision",
+            "subfolder",
             "backend",
             "backend_version",
             "dtype",
@@ -698,7 +722,7 @@ def _replacement_groups_for_selection(
             continue
         reusable_single = (
             not private_actor
-            and spec.model.parallelism.mode == "single"
+            and spec.execution_mode == "single"
             and _actor_matches_spec(gpu.actor_key_data, spec)
         )
         if reusable_single:
@@ -795,6 +819,7 @@ def _warm_sharded_groups(
     required_memory: int,
     safety_margin_bytes: int,
 ) -> tuple[tuple[GPUCandidate, ...], ...]:
+    assert spec.model is not None
     """Find complete exact warm replicas without combining unrelated shards."""
 
     by_uuid = {gpu.uuid: gpu for gpu in gpus}

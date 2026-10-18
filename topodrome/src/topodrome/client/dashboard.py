@@ -512,7 +512,7 @@ def _job_lines(
             "SITE": _text(row.get("site_id"), "-"),
             "GPU": str(_integer(row.get("gpu_count") or row.get("gpu"))),
             "PROGRESS": _progress_text(row.get("progress"), width=progress_width),
-            "MODEL": _text(row.get("model"), "-"),
+            "MODEL": _text(row.get("model"), "none (GPU)"),
         }
         cells = [
             _paint(_cell(values[label], size), _state_color(state), color=color)

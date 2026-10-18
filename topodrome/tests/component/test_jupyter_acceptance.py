@@ -378,7 +378,7 @@ async def _wait_state(
 def _heartbeat(*, sequence: int, warm_service: bool = False) -> SiteHeartbeat:
     models = [
         ModelCapability(
-            alias="model",
+            repo_id="test/model",
             revision="rev",
             backend="transformers",
             backend_version="configured",
@@ -471,7 +471,7 @@ async def test_production_kernel_path_modes_auth_idle_and_restart(
         base_url="http://127.0.0.1:8042",
     ) as client:
         request = KernelRequest(
-            model={"alias": "model", "revision": "rev"},
+            model={"repo_id": "test/model", "revision": "rev"},
             resources={"gpu": 1, "min_vram_gb": 15},
             mode=KernelMode.SERVICE,
             idle_timeout_seconds=60,

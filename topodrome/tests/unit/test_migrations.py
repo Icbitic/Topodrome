@@ -25,6 +25,70 @@ def test_production_readiness_revision_tracks_alembic_head() -> None:
     assert ScriptDirectory.from_config(config).get_current_head() == CURRENT_SCHEMA_REVISION
 
 
+def test_repository_address_conversion_preserves_history_and_user_data(tmp_path: Path) -> None:
+    path = tmp_path / "model-addresses.sqlite3"
+    _upgrade(path, "0019_remove_db_legacies")
+    legacy = {"entrypoint": "run.py", "model": {
+        "alias": "meta-llama-3-8b-instruct", "revision": "a" * 40,
+    }, "kwargs": {"alias": "this is user data", "model": "do not rewrite"},
+        "assets": {"alias": "job://job_other/results/"}}
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            "INSERT INTO jobs (id,state,spec,priority,cancel_requested,created_at,updated_at) "
+            "VALUES ('job_historical','succeeded',?,0,0,'2026-10-01','2026-10-01')",
+            (json.dumps(legacy),),
+        )
+        connection.execute(
+            "INSERT INTO model_capabilities (site_id,alias,revision,backend,backend_version,"
+            "dtype,quantization,adapter,availability,gpu_uuid,verified_at) "
+            "VALUES ('site','meta-llama-3-8b-instruct',?,'transformers','configured',"
+            "'bfloat16','','','cached','','2026-10-01')", ("a" * 40,),
+        )
+    _upgrade(path)
+    _assert_sqlite_schema_matches_models(path)
+    with sqlite3.connect(path) as connection:
+        spec = json.loads(connection.execute("SELECT spec FROM jobs").fetchone()[0])
+        assert spec["model"] == {
+            "repo_id": "meta-llama/Meta-Llama-3-8B-Instruct", "revision": "a" * 40,
+            "subfolder": None,
+        }
+        assert spec["kwargs"] == legacy["kwargs"]
+        assert spec["assets"] == legacy["assets"]
+        capability = connection.execute(
+            "SELECT repo_id,subfolder FROM model_capabilities"
+        ).fetchone()
+        assert capability == (
+            "meta-llama/Meta-Llama-3-8B-Instruct", "",
+        )
+
+
+@pytest.mark.parametrize("blocker", ["unknown_alias", "active_lease"])
+def test_repository_address_conversion_refuses_unsafe_cutover_before_ddl(tmp_path, blocker):
+    path = tmp_path / "model-address-preflight.sqlite3"
+    _upgrade(path, "0019_remove_db_legacies")
+    with sqlite3.connect(path) as connection:
+        if blocker == "unknown_alias":
+            connection.execute(
+                "INSERT INTO jobs (id,state,spec,priority,cancel_requested,created_at,updated_at) "
+                "VALUES ('job','succeeded',?,0,0,'2026-10-01','2026-10-01')",
+                (json.dumps({"model": {"alias": "unknown-old-name"}}),),
+            )
+        else:
+            connection.execute(
+                "INSERT INTO leases (id,attempt_id,site_id,state,fencing_token_digest,"
+                "expires_at,created_at,updated_at) VALUES "
+                "('lease','attempt','site','active','token','2026-10-01','2026-10-01','2026-10-01')"
+            )
+    with pytest.raises(RuntimeError, match=r"explicit repository|idle cluster"):
+        _upgrade(path)
+    with sqlite3.connect(path) as connection:
+        columns = {row[1] for row in connection.execute("PRAGMA table_info(model_capabilities)")}
+        assert "alias" in columns and "repo_id" not in columns
+        assert connection.execute("SELECT version_num FROM alembic_version").fetchone() == (
+            "0019_remove_db_legacies",
+        )
+
+
 def _run_alembic(path: Path, operation: str, revision: str) -> None:
     config = Config(str(PROJECT_ROOT / "alembic.ini"))
     config.set_main_option("script_location", str(PROJECT_ROOT / "migrations"))
@@ -310,8 +374,7 @@ def test_database_cleanup_preserves_records_and_round_trips(tmp_path: Path) -> N
         )
         before = [connection.execute(query).fetchall() for query in queries]
 
-    _upgrade(path)
-    _assert_sqlite_schema_matches_models(path)
+    _upgrade(path, "0019_remove_db_legacies")
     _run_alembic(path, "downgrade", "0018_job_arrays")
     with sqlite3.connect(path) as connection:
         assert connection.execute("SELECT count(*) FROM log_indexes").fetchone() == (0,)

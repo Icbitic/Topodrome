@@ -31,7 +31,7 @@ async def test_claim_requires_own_live_attempt_and_site_auth(database, tmp_path)
             JobRow(
                 id="job",
                 state=JobState.RUNNING,
-                spec=JobSpec(entrypoint="run.py", model="model").model_dump(mode="json"),
+                spec=JobSpec(entrypoint="run.py", model="test/model").model_dump(mode="json"),
             )
         )
         s.add(

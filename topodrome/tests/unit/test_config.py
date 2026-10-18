@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
+import yaml
 from pydantic import ValidationError
 
 from topodrome.config import ModelCatalog, SchedulerSettings, SiteModelLocation, SiteSettings
@@ -176,7 +177,7 @@ def test_multi_user_access_requires_an_absolute_credential_store(tmp_path: Path)
 def test_model_catalog_carries_bounded_per_site_startup_estimates() -> None:
     repository = Path(__file__).resolve().parents[2]
     catalog = ModelCatalog.from_yaml(repository / "configs/models.example.yaml")
-    locations = catalog.resolve("meta-llama-3-8b-instruct").sites
+    locations = catalog.resolve("meta-llama/Meta-Llama-3-8B-Instruct").sites
 
     assert locations["lab1"].estimated_startup_seconds == 2
     assert locations["remote-jupyter-1"].estimated_startup_seconds == 120
@@ -531,9 +532,10 @@ def test_autodl_examples_use_manual_capacity_and_safe_routes(
     monkeypatch.setenv("TOPODROME_SITE_FENCE_VERIFICATION_KEY", "f" * 32)
     site = SiteSettings.from_yaml(repository / "configs/site.autodl.example.yaml")
     assert site.scheduler_url == "http://127.0.0.1:18042"
-    assert site.rclone is not None
-    assert site.rclone.mode == "mirror"
-    assert site.rclone.remote == "lab1-global:"
+    assert site.storage is not None
+    assert site.storage.bulk_url == "http://127.0.0.1:18043"
+    assert site.bulk_ssh_local_forward is not None
+    assert site.bulk_ssh_local_forward.local_port != site.ssh_local_forward.local_port
     assert site.global_root.is_relative_to(Path("/root/autodl-tmp"))
     assert site.ssh_local_forward is not None
     assert site.ssh_local_forward.remote_host == "111.127.53.162"
@@ -602,28 +604,84 @@ def test_site_ssh_forward_requires_matching_loopback_scheduler_url(tmp_path: Pat
         )
 
 
-def test_site_rclone_namespace_must_match_global_root(tmp_path: Path) -> None:
+def test_site_yaml_refuses_unknown_transport_fields(tmp_path, monkeypatch):
+    monkeypatch.setenv("TOPODROME_SITE_FENCE_VERIFICATION_KEY", "f" * 32)
+    repository = Path(__file__).resolve().parents[2]
+    value = yaml.safe_load((repository / "configs/site.jupyter.example.yaml").read_text())
+    value["unknown_storage_backend"] = {"remote": "elsewhere"}
+    path = tmp_path / "unknown.yaml"
+    path.write_text(yaml.safe_dump(value))
+    with pytest.raises(ValueError, match="unsupported site configuration fields"):
+        SiteSettings.from_yaml(path)
+
+
+@pytest.mark.parametrize(
+    "invalid",
+    [
+        None,
+        "missing",
+        "port",
+        "state",
+        "authority",
+        "url",
+        "renewal",
+        "no-candidate",
+        "candidate-control",
+        "candidate-bulk",
+    ],
+)
+def test_http_bulk_route_is_independent_but_uses_the_same_authority(tmp_path, invalid):
+    control = {
+        "identity_file": tmp_path / "id_ed25519",
+        "known_hosts_file": tmp_path / "known_hosts",
+        "remote_host": "lab1.example",
+        "remote_user": "topodrome",
+        "remote_port": 2201,
+        "local_port": 18042,
+        "target_port": 8042,
+        "state_directory": tmp_path / "control",
+    }
+    bulk = {**control, "local_port": 18043, "state_directory": tmp_path / "bulk"}
     values = {
-        "site_id": "jupyter",
-        "display_name": "Jupyter",
-        "scheduler_url": "https://scheduler.invalid",
+        "site_id": "remote",
+        "display_name": "Remote",
+        "scheduler_url": "http://127.0.0.1:18042",
         "global_root": tmp_path / "global",
         "scratch_root": tmp_path / "scratch",
         "spool_path": tmp_path / "spool.sqlite3",
         "fence_verification_key": "s" * 32,
-        "rclone": {
-            "mode": "mirror",
-            "mountpoint": tmp_path / "different-cache",
-            "remote": "lab1-global:",
-            "cache_dir": tmp_path / "vfs-cache",
-        },
+        "storage": {"bulk_url": "http://127.0.0.1:18043"},
+        "ssh_local_forward": control,
+        "bulk_ssh_local_forward": bulk,
     }
-
-    with pytest.raises(ValidationError, match="managed rclone namespace"):
-        SiteSettings(**values)
-
-    values["rclone"]["mountpoint"] = tmp_path / "global"
-    assert SiteSettings(**values).rclone is not None
+    if invalid == "missing":
+        values.pop("bulk_ssh_local_forward")
+    elif invalid == "port":
+        bulk["local_port"] = 18042
+        values["storage"]["bulk_url"] = "http://127.0.0.1:18042"
+    elif invalid == "state":
+        bulk["state_directory"] = control["state_directory"]
+    elif invalid == "authority":
+        bulk["remote_host"] = "other-authority.example"
+    elif invalid == "url":
+        values["storage"]["bulk_url"] = "http://127.0.0.1:18044"
+    elif invalid in {"renewal", "no-candidate", "candidate-control", "candidate-bulk"}:
+        values["storage"]["bulk_reconnect"] = {
+            "enabled": True,
+            "candidate_port": {
+                "renewal": 18044,
+                "no-candidate": None,
+                "candidate-control": 18042,
+                "candidate-bulk": 18043,
+            }[invalid],
+        }
+    if invalid in {None, "renewal"}:
+        configured = SiteSettings(**values)
+        assert configured.bulk_ssh_local_forward.local_port == 18043
+        assert configured.storage.bulk_reconnect.enabled == (invalid == "renewal")
+    else:
+        with pytest.raises(ValidationError):
+            SiteSettings(**values)
 
 
 @pytest.mark.parametrize(

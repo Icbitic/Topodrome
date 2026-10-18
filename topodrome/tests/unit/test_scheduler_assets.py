@@ -9,12 +9,54 @@ from topodrome.domain.errors import ConflictError, NotFoundError
 from topodrome.scheduler.assets import (
     AssetCatalog,
     AssetPublishRequest,
+    AssetTagUpdate,
     job_id_from_ref,
     resolve_job_asset,
 )
 from topodrome.storage.artifacts import CommitManifest, CommittedArtifact
 
 pytestmark = pytest.mark.unit
+
+
+def test_latest_versions_before_limit_and_tags_with_namespace_isolation(tmp_path):
+    now = datetime(2026, 9, 13, tzinfo=UTC)
+    catalog = AssetCatalog(tmp_path, clock=lambda: now)
+    for owner, visibility, name, version, day in [
+        ("alice", "private", "lens", "v99", 13),
+        ("alice", "private", "other", "v1", 14),
+        ("alice", "private", "lens", "v1", 15),
+        ("alice", "private", "lens", "v2", 16),
+        ("bob", "private", "lens", "v100", 17),
+        ("bob", "shared", "lens", "v0", 18),
+    ]:
+        now = datetime(2026, 9, day, tzinfo=UTC)
+        catalog.publish(
+            AssetPublishRequest(
+                name=name,
+                version=version,
+                job_id="job-producer",
+                path="lens",
+                visibility=visibility,
+            ),
+            owner_username=owner,
+            source_manifest=_manifest(),
+        )
+    rows = catalog.list_visible(requester_username="alice", limit=3)
+    assert [(r.visibility, r.name, r.version) for r in rows] == [
+        ("shared", "lens", "v0"),
+        ("private", "lens", "v2"),
+        ("private", "other", "v1"),
+    ]
+    assert len(catalog.list_visible(requester_username="alice", all_versions=True)) == 5
+    assert catalog.get("lens", "v99", requester_username="alice").version == "v99"
+    catalog.update_tags("lens", "v99", AssetTagUpdate(add=("old",)), requester_username="alice")
+    assert catalog.list_visible(requester_username="alice", tags=("old",)) == []
+    assert [
+        r.version
+        for r in catalog.list_visible(requester_username="alice", tags=("old",), all_versions=True)
+    ] == ["v99"]
+    catalog.delete("lens", "v2", requester_username="alice")
+    assert catalog.list_visible(requester_username="alice", visibility="private")[0].version == "v1"
 
 
 def _manifest(

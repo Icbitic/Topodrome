@@ -103,6 +103,22 @@ async def test_registration_private_idempotent_no_api(tmp_path, database, monkey
 
 
 @pytest.mark.asyncio
+async def test_maintenance_fence_rejects_new_install_and_removal(tmp_path, database, monkeypatch):
+    c = controller(tmp_path, database)
+    c.maintenance_excluded = lambda _site_id: True
+    monkeypatch.setattr(module, "inspect", AsyncMock(return_value={"site_id": SITE}))
+    request = ManualRegistration(ssh="ssh -p 22 root@x.seetacloud.com", password="test-password")
+    with pytest.raises(ValueError, match="fenced"):
+        await c.register(request)
+    with pytest.raises(ValueError, match="fenced"):
+        await c.unregister(SITE, automatic=True)
+    assert c.tasks == {}
+    async with database.session() as session:
+        assert await session.scalar(select(ProviderInstanceRow)) is None
+    await c.close()
+
+
+@pytest.mark.asyncio
 async def test_unregister_disconnected_preserves_audit_and_disables_token(tmp_path, database):
     c = controller(tmp_path, database)
     private_write(c.root / (SITE + ".json"), {"site_id": SITE})
@@ -291,6 +307,17 @@ async def test_manual_api_operator_only_and_sdk(tmp_path, database, monkeypatch)
         assert result["site_id"] == SITE
         assert (await client.unregister_autodl(SITE))["state"] == "unregistered"
     assert registered.await_count == 1
+
+    monkeypatch.setattr(app.state.service.upgrades.store, "blocked", lambda _site: True)
+    async with AsyncClient("http://test", token="operator-test", transport=transport) as client:
+        response = await client._http.post(
+            "/api/v1/providers/autodl/register",
+            json={"ssh": "ssh -p 22 root@x.seetacloud.com", "password": "test-password"},
+        )
+        assert response.status_code == 409
+        response = await client._http.delete(f"/api/v1/providers/autodl/registrations/{SITE}")
+        assert response.status_code == 409
+    assert registered.await_count == unregistered.await_count == 1
 
 
 @pytest.mark.asyncio

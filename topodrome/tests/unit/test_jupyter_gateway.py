@@ -102,8 +102,8 @@ async def test_gateway_allows_shared_service_actor_and_cleans_up() -> None:
         id_factory=_ids("session-1", "session-2"),
     )
 
-    first = await gateway.create(KernelRequest(model="llama", mode=KernelMode.SERVICE))
-    second = await gateway.create(KernelRequest(model="llama", mode=KernelMode.SERVICE))
+    first = await gateway.create(KernelRequest(model="test/llama", mode=KernelMode.SERVICE))
+    second = await gateway.create(KernelRequest(model="test/llama", mode=KernelMode.SERVICE))
 
     assert first.state is second.state is KernelState.RUNNING
     assert await gateway.stop("session-1") == (await gateway.get("session-1"))
@@ -124,7 +124,7 @@ async def test_raw_sessions_cannot_share_gpu_or_private_actor() -> None:
         store=store,
         id_factory=_ids("raw-1", "raw-2"),
     )
-    request = KernelRequest(model="llama", mode=KernelMode.RAW_MODEL)
+    request = KernelRequest(model="test/llama", mode=KernelMode.RAW_MODEL)
 
     await gateway.create(request)
     with pytest.raises(KernelGatewayError):
@@ -145,7 +145,7 @@ async def test_idle_expiry_uses_sliding_activity_deadline() -> None:
         id_factory=_ids("session-1"),
     )
     await gateway.create(
-        KernelRequest(model="llama", mode=KernelMode.SERVICE, idle_timeout_seconds=60)
+        KernelRequest(model="test/llama", mode=KernelMode.SERVICE, idle_timeout_seconds=60)
     )
     clock.now += timedelta(seconds=30)
     await gateway.touch("session-1")
@@ -168,7 +168,7 @@ async def test_start_failure_rolls_back_and_is_sanitized() -> None:
     )
 
     with pytest.raises(KernelGatewayError) as raised:
-        await gateway.create(KernelRequest(model="llama"))
+        await gateway.create(KernelRequest(model="test/llama"))
 
     assert "should-not-leak" not in str(raised.value)
     assert launcher.stopped == ["session-1"]

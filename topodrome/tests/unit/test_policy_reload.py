@@ -134,7 +134,7 @@ def _write_models(path: Path, *, startup_seconds: float, model_path: str = "/mod
         yaml.safe_dump(
             {
                 "models": {
-                    "model": {
+                    "test/model": {
                         "revision": "rev",
                         "backend": "transformers",
                         "backend_version": "configured",
@@ -177,7 +177,7 @@ async def test_policy_reload_is_durably_staged_idempotent_and_visible_in_status(
     service = app.state.service
     original = service.scheduling_policy_snapshot()
     assert original.generation == 1
-    assert original.startup_seconds("model") == {"lab1": 2.0}
+    assert original.startup_seconds("test/model", "rev") == {"lab1": 2.0}
 
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app),
@@ -235,12 +235,13 @@ async def test_policy_reload_is_durably_staged_idempotent_and_visible_in_status(
         current = service.scheduling_policy_snapshot()
         assert current.generation == 2
         assert current.settings.queue_delay_seconds_per_job == 12.5
-        assert current.startup_seconds("model") == {"lab1": 120.0}
+        assert current.startup_seconds("test/model", "rev") == {"lab1": 120.0}
         assert original.settings.queue_delay_seconds_per_job == 30
-        assert original.startup_seconds("model") == {"lab1": 2.0}
+        assert original.startup_seconds("test/model", "rev") == {"lab1": 2.0}
         # The immutable model catalog used to resolve job semantics is not
         # replaced; only its copied startup estimate enters the new policy.
-        assert service.model_catalog.models["model"].sites["lab1"].estimated_startup_seconds == 2
+        location = service.model_catalog.models["test/model"].sites["lab1"]
+        assert location.estimated_startup_seconds == 2
         status = (await client.get("/api/v1/status")).json()["policy"]
         assert status["status"] == "active"
         assert status["generation"] == 2
@@ -388,7 +389,9 @@ async def test_policy_reload_pauses_dispatch_until_interactive_host_lease_finish
             JobRow(
                 id="job-interactive-host",
                 state=JobState.RUNNING,
-                spec=JobSpec(entrypoint="experiment.py", model="model").model_dump(mode="json"),
+                spec=JobSpec(entrypoint="experiment.py", model="test/model").model_dump(
+                    mode="json"
+                ),
             )
         )
         session.add(

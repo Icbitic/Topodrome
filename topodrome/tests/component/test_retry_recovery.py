@@ -46,7 +46,7 @@ def _heartbeat() -> SiteHeartbeat:
         ),
         models=(
             ModelCapability(
-                alias="model",
+                repo_id="test/model",
                 revision="rev",
                 backend="transformers",
                 backend_version="configured",
@@ -80,7 +80,7 @@ async def test_retry_deadline_and_checkpoint_lineage_survive_scheduler_restart(
                 session,
                 JobSpec(
                     entrypoint="experiment.py",
-                    model={"alias": "model", "revision": "rev"},
+                    model={"repo_id": "test/model", "revision": "rev"},
                     resources={"gpu": 1, "min_vram_gb": 15},
                     retry={
                         "max_attempts": 3,
@@ -227,7 +227,7 @@ async def test_scheduler_rotates_long_running_gang_fence_beyond_three_hours(
     gang_spec = JobSpec(
         entrypoint="experiment.py",
         model={
-            "alias": "model",
+            "repo_id": "test/model",
             "revision": "rev",
             "parallelism": {
                 "mode": "model_sharded",

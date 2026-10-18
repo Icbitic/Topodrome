@@ -6,6 +6,34 @@ credentials only from the mode-checked file at
 never pass credential values in process arguments. Run them from the
 `topodrome/` directory.
 
+## Transport validation (no GPU)
+
+The hermetic HTTP tests cover persistent tiny-file requests, paged source
+trees, corruption, lost acknowledgements, and transfers exceeding 2 GiB in
+both directions with nonzero resume offsets after adapter restart:
+
+```bash
+uv run pytest tests/component/test_http_transport.py tests/component/test_http_large_resume.py
+```
+
+Run the complete hermetic suite first, before any external validation. Lab1
+bulk test data, caches, reports and deployment staging must reside on `/ssd`.
+
+`prepare_transport_benchmark.py` can create labeled, synthetic terminal-job
+metadata and byte-verified private fixtures on an idle scheduler. It does not
+execute a GPU job or rent capacity. It requires
+`--ack RUN_TRANSPORT_BENCHMARK`, protected scheduler configuration/environment,
+a new private state directory, and an enrolled site ID. The descriptor and
+receipt contain identities/paths/digests, never credentials. Recovery validates
+that exact synthetic fixture instead of overwriting unrelated files. This is
+fixture preparation only, not an automatic external benchmark runner.
+
+Preserve failure receipts and pending prefixes while debugging. Cleanup must
+validate exact synthetic job/source/pin identities and prove no accepted
+consumer or live transfer owns them before removal. Never clean unrelated
+users' payloads or relax disk-admission floors. See
+[HTTP transport](../docs/HTTP_TRANSPORT.md).
+
 The wrappers default `UV_CACHE_DIR` to
 `/ssd/xiangkun/.cache/topodrome-uv` so large package caches do not consume the
 small root filesystem. An existing explicit `UV_CACHE_DIR` is preserved.
@@ -152,8 +180,8 @@ bootstrap. Production uses the generated, secret-free release documented under
 "AutoDL production bootstrap" in the project README; its uv environment and all
 runtime caches live under `/root/autodl-tmp`. Production can bind the same
 Lab1-hosted `site-packages/` seed to the exact `uv.lock` and worker platform,
-fetch it with the bundled rclone, and then require a frozen offline `uv sync`;
-the seed is not stored in the 20 GiB Beijing-B regional filesystem.
+fetch it with the stdlib HTTP helper, and then require a frozen offline `uv sync`;
+a verified regional seed cache is reused across instance replacement.
 
 First add `TOPODROME_HF_TOKEN` to the protected secret file. The paid smoke has
 three independent cost bounds:

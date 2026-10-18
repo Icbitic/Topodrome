@@ -10,7 +10,7 @@ from topodrome.scheduler.control import AgentConnection, AgentConnectionRegistry
 
 
 def spec(**kwargs):
-    return JobSpec(entrypoint="run.py", model="llama", **kwargs)
+    return JobSpec(entrypoint="run.py", model="test/llama", **kwargs)
 
 
 def test_metadata_optional_and_runtime_neutral():
@@ -75,7 +75,7 @@ async def test_display_metadata_is_not_sent_to_older_agents():
 
 def test_cli_metadata_overrides_manifest(tmp_path, monkeypatch):
     manifest = tmp_path / "job.yaml"
-    manifest.write_text("entrypoint: run.py\nmodel: llama\nname: original\n")
+    manifest.write_text("entrypoint: run.py\nmodel: test/llama\nname: original\n")
     captured = []
 
     class Client:

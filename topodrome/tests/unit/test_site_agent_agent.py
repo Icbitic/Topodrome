@@ -93,7 +93,7 @@ def test_assignment_accepts_shared_domain_offer_shape_without_exposing_token() -
         spec=JobSpec(
             entrypoint="experiments/probe.py",
             model={
-                "alias": "meta-llama-3-8b-instruct",
+                "repo_id": "meta-llama/Meta-Llama-3-8B-Instruct",
                 "revision": "8afb486c1db24fe5011ec46dfbe5b5dccdb575c2",
                 "backend": "transformers",
                 "backend_version": "4.48",
@@ -116,7 +116,7 @@ def test_assignment_accepts_shared_domain_offer_shape_without_exposing_token() -
     assert assignment.lease.memory_bytes == 6 * 1024**3
     assert assignment.lease.replace_idle_actors
     assert assignment.entrypoint == "experiments/probe.py"
-    assert "meta-llama-3-8b-instruct" in assignment.model_key
+    assert "meta-llama/Meta-Llama-3-8B-Instruct" in assignment.model_key
     assert json.loads(assignment.model_key)["runtime_fingerprint"] == (
         offer.spec.runtime_fingerprint
     )
@@ -210,7 +210,7 @@ def test_adapter_training_assignment_disables_warm_actor_reuse() -> None:
         site_id="lab1",
         spec=JobSpec(
             entrypoint="experiments/train_adapter.py",
-            model={"alias": "model", "revision": "rev"},
+            model={"repo_id": "test/model", "revision": "rev"},
             resources={"gpu": 1, "min_vram_gb": 15},
             workload_kind="adapter_training",
         ),
@@ -234,7 +234,7 @@ def test_multi_gpu_assignment_disables_single_actor_reuse() -> None:
         spec=JobSpec(
             entrypoint="experiments/distributed.py",
             model={
-                "alias": "model",
+                "repo_id": "test/model",
                 "revision": "rev",
                 "parallelism": {
                     "mode": "distributed",
@@ -267,7 +267,7 @@ def test_model_sharded_assignment_allows_only_complete_group_reuse() -> None:
         spec=JobSpec(
             entrypoint="experiments/inference.py",
             model={
-                "alias": "model",
+                "repo_id": "test/model",
                 "revision": "rev",
                 "parallelism": {
                     "mode": "model_sharded",
@@ -316,7 +316,7 @@ def test_model_sharded_assignment_rejects_incomplete_or_oversized_claims_before_
         "spec": {
             "entrypoint": "experiments/inference.py",
             "model": {
-                "alias": "model",
+                "repo_id": "test/model",
                 "revision": "rev",
                 "parallelism": {
                     "mode": "model_sharded",

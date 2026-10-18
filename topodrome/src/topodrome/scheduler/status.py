@@ -75,6 +75,7 @@ async def system_status_snapshot(
     sites = list(
         await session.scalars(
             select(SiteRow)
+            .where(SiteRow.state != SiteState.RETIRED)
             .where(or_(SiteRow.kind != SiteKind.AUTODL, SiteRow.state != SiteState.STOPPED))
             .order_by(SiteRow.id)
             .limit(site_limit)
@@ -353,7 +354,8 @@ async def job_status_rows(session, jobs, *, now=None):
                 "gpu_count": 0
                 if stage is not None or released
                 else actual_gpu_count or spec.resources.gpu_count,
-                "model": spec.model.alias,
+                "model": spec.model.repo_id if spec.model is not None else None,
+                **({"execution": spec.execution_mode} if spec.model is None else {}),
                 "workload_kind": spec.workload_kind.value,
                 "estimated_runtime_seconds": spec.estimated_runtime_seconds,
                 "created_at": job.created_at,

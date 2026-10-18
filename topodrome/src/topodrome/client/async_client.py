@@ -13,6 +13,7 @@ from typing import Any
 
 import httpx
 
+from topodrome.domain.scheduling import SitePreferenceRequest
 from topodrome.domain.specs import (
     GPUReservationExtensionRequest,
     GPUReservationRequest,
@@ -24,6 +25,7 @@ from topodrome.domain.specs import (
     KernelRequest,
     KernelSummary,
 )
+from topodrome.domain.upgrades import UpgradeRequest
 from topodrome.scheduler.assets import (
     AssetPublishRequest,
     AssetSummary,
@@ -220,8 +222,11 @@ class AsyncClient:
         visibility: AssetVisibility | None = None,
         limit: int = 100,
         tags: tuple[str, ...] = (),
+        all_versions: bool = False,
     ) -> list[AssetSummary]:
         params: dict[str, str | int | list[str]] = {"limit": limit}
+        if all_versions:
+            params["all_versions"] = "true"
         if visibility is not None:
             params["visibility"] = visibility
         if tags:
@@ -265,6 +270,12 @@ class AsyncClient:
         )
         _raise(response)
         return AssetSummary.model_validate(response.json())
+
+    async def download(self, reference: str, destination: str | Path) -> Path:
+        """Download a job:// or asset:// file/tree to an editable, resumable copy."""
+        from .download import download_async
+
+        return await download_async(self._http, reference, destination, _raise)
 
     async def download_asset(
         self,
@@ -455,8 +466,11 @@ class AsyncClient:
     async def gpus(self) -> list[dict[str, Any]]:
         return await self._list("/api/v1/gpus")
 
-    async def models(self) -> list[dict[str, Any]]:
-        return await self._list("/api/v1/models")
+    async def models(self, *, repo_id: str | None = None) -> list[dict[str, Any]]:
+        """List site snapshots, including registered refs and the default marker."""
+        return await self._list(
+            "/api/v1/models", params={"repo_id": repo_id} if repo_id is not None else None
+        )
 
     async def reserve_gpu(
         self,
@@ -520,10 +534,54 @@ class AsyncClient:
         _raise(response)
         return dict(response.json())
 
+    async def system_metrics(self) -> dict[str, Any]:
+        """Fetch cached central storage and service diagnostics (operator only)."""
+        response = await self._http.get("/api/v1/system")
+        _raise(response)
+        return dict(response.json())
+
     async def reload_policy(self) -> dict[str, Any]:
         """Validate and stage the configured scheduling policy."""
 
         response = await self._http.post("/api/v1/policy/reload")
+        _raise(response)
+        return dict(response.json())
+
+    async def set_site_preference(self, request: SitePreferenceRequest) -> dict[str, Any]:
+        response = await self._http.put(
+            "/api/v1/policy/site-preference", json=request.model_dump(mode="json")
+        )
+        _raise(response)
+        return dict(response.json())
+
+    async def upgrades(self) -> list[dict[str, Any]]:
+        response = await self._http.get("/api/v1/upgrades")
+        _raise(response)
+        return list(response.json())
+
+    async def queue_upgrade(self, request: UpgradeRequest) -> dict[str, Any]:
+        response = await self._http.post("/api/v1/upgrades",
+                                        json=request.model_dump(mode="json"), timeout=180)
+        _raise(response)
+        return dict(response.json())
+
+    async def cancel_upgrade(self, upgrade_id: str) -> dict[str, Any]:
+        response = await self._http.post(f"/api/v1/upgrades/{upgrade_id}/cancel")
+        _raise(response)
+        return dict(response.json())
+
+    async def change_upgrade_pause(
+        self, upgrade_id: str, *, pause: str, expected_pause: str
+    ) -> dict[str, Any]:
+        response = await self._http.post(f"/api/v1/upgrades/{upgrade_id}/pause", json={
+            "pause": pause, "expected_pause": expected_pause,
+        })
+        _raise(response)
+        return dict(response.json())
+
+    async def recover_upgrade(self, upgrade_id: str, *, action: str) -> dict[str, Any]:
+        response = await self._http.post(f"/api/v1/upgrades/{upgrade_id}/recover",
+                                        json={"action": action})
         _raise(response)
         return dict(response.json())
 
@@ -585,8 +643,10 @@ class AsyncClient:
     async def autodl_operations(self) -> list[dict[str, Any]]:
         return await self._list("/api/v1/providers/autodl/operations")
 
-    async def _list(self, path: str) -> list[dict[str, Any]]:
-        response = await self._http.get(path)
+    async def _list(
+        self, path: str, *, params: dict[str, str] | None = None
+    ) -> list[dict[str, Any]]:
+        response = await self._http.get(path, params=params)
         _raise(response)
         return list(response.json())
 

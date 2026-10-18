@@ -33,10 +33,13 @@ from topodrome.config import ModelCatalog, SchedulerSettings
 from topodrome.db.session import CURRENT_SCHEMA_REVISION, Database
 from topodrome.deployment.manual_autodl import ManualRegistration, ManualRelease
 from topodrome.domain.arrays import ArrayUpdate, JobArraySpec
+from topodrome.domain.downloads import DownloadManifest, DownloadRenewal, DownloadRequest
 from topodrome.domain.enums import KernelMode
 from topodrome.domain.errors import ConflictError, NotFoundError, StaleFenceError, TopodromeError
 from topodrome.domain.events import AgentEnvelope
 from topodrome.domain.logs import LOG_READ_LIMIT_BYTES
+from topodrome.domain.model_address import validate_repo_id
+from topodrome.domain.scheduling import SitePreferenceRequest
 from topodrome.domain.specs import (
     GPUReservationExtensionRequest,
     GPUReservationRequest,
@@ -49,6 +52,12 @@ from topodrome.domain.specs import (
     KernelRequest,
     KernelSummary,
     contains_sensitive_key,
+)
+from topodrome.domain.upgrades import (
+    UpgradeClaim,
+    UpgradePauseRequest,
+    UpgradeRecovery,
+    UpgradeRequest,
 )
 from topodrome.jupyter.protocol import (
     JUPYTER_WEBSOCKET_PROTOCOL,
@@ -189,6 +198,7 @@ def create_app(
                     if service.provider_controller is not None:
                         await service.provider_controller.close()
                 finally:
+                    await service.system_metrics.close()
                     await database.close()
 
     app = FastAPI(title="Topodrome", version="1.0", lifespan=lifespan)
@@ -602,6 +612,15 @@ def create_app(
     from topodrome.scheduler.storage_digest import digest_router
 
     app.include_router(digest_router(settings.global_root, enrollment_token))
+    from topodrome.scheduler.small_files import small_file_router
+
+    app.include_router(small_file_router(settings.global_root, enrollment_token))
+    from topodrome.scheduler.bulk_upload import bulk_upload_router
+
+    app.include_router(bulk_upload_router(settings.global_root, enrollment_token))
+    from topodrome.scheduler.file_transport import file_transport_router
+
+    app.include_router(file_transport_router(settings.global_root, enrollment_token))
 
     @app.websocket("/api/v1/agents/control")
     async def agent_control(
@@ -690,6 +709,61 @@ def create_app(
 def _api_router() -> APIRouter:
     router = APIRouter(prefix="/api/v1", dependencies=[Depends(_authorize_user)])
     asset_upload_slots = asyncio.Semaphore(2)
+
+    @router.post("/downloads", response_model=DownloadManifest, status_code=201)
+    async def create_download(request: Request, response: Response, body: DownloadRequest):
+        response.headers["Cache-Control"] = "private, no-store"
+        principal = _principal(request)
+        return await _service(request).create_download(
+            body.reference,
+            owner_username=principal.username,
+            is_admin=principal.is_admin,
+        )
+
+    @router.post("/downloads/{download_id}/renew", response_model=DownloadRenewal)
+    async def renew_download(request: Request, response: Response, download_id: str):
+        response.headers["Cache-Control"] = "private, no-store"
+        pin = await _service(request).renew_download(
+            download_id, owner_username=_principal(request).username
+        )
+        return DownloadRenewal(download_id=download_id, expires_at=pin.manifest.expires_at)
+
+    @router.delete("/downloads/{download_id}", status_code=204)
+    async def close_download(request: Request, download_id: str):
+        await _service(request).close_download(
+            download_id, owner_username=_principal(request).username
+        )
+        return Response(status_code=204, headers={"Cache-Control": "private, no-store"})
+
+    @router.get("/downloads/{download_id}/files/{member_index}")
+    async def download_file(request: Request, download_id: str, member_index: int):
+        from topodrome.scheduler.asset_download import DownloadFileResponse, open_member
+
+        service = _service(request)
+        owner = _principal(request).username
+        pin = await service.renew_download(download_id, owner_username=owner)
+        if not 0 <= member_index < len(pin.members):
+            raise NotFoundError("download file does not exist")
+        opening = asyncio.create_task(
+            asyncio.to_thread(open_member, service.settings.global_root, pin.members[member_index])
+        )
+        try:
+            handle = await asyncio.shield(opening)
+        except asyncio.CancelledError:
+            handle = await opening
+            handle.close()
+            raise
+
+        async def renew():
+            await service.renew_download(download_id, owner_username=owner)
+
+        return DownloadFileResponse(
+            handle,
+            pin.members[member_index],
+            range_header=request.headers.get("Range"),
+            if_match=request.headers.get("If-Match"),
+            renew=renew,
+        )
 
     @router.post("/asset-uploads/{name}/{version}", response_model=AssetSummary)
     async def upload_asset(
@@ -832,6 +906,7 @@ def _api_router() -> APIRouter:
         visibility: Annotated[AssetVisibility | None, Query()] = None,
         limit: Annotated[int, Query(ge=1, le=1000)] = 100,
         tag: Annotated[list[str] | None, Query(max_length=32)] = None,
+        all_versions: bool = False,
     ) -> list[AssetSummary]:
         response.headers["Cache-Control"] = "no-store"
         try:
@@ -843,6 +918,7 @@ def _api_router() -> APIRouter:
             visibility=visibility,
             limit=limit,
             tags=tags,
+            all_versions=all_versions,
         )
 
     @router.delete("/assets/{name}/{version}", response_model=AssetDeleteResult)
@@ -1164,14 +1240,40 @@ def _api_router() -> APIRouter:
         return await _service(request).extend_gpu_reservation(reservation_id, extension)
 
     @router.get("/models")
-    async def models(request: Request) -> list[dict[str, Any]]:
+    async def models(
+        request: Request,
+        response: Response,
+        repo_id: Annotated[str | None, Query(min_length=1, max_length=193)] = None,
+    ) -> list[dict[str, Any]]:
+        """Discover advertised snapshots and their operator-registered ref labels."""
+        if repo_id is not None:
+            try:
+                repo_id = validate_repo_id(repo_id)
+            except ValueError as exc:
+                raise HTTPException(status_code=422, detail=str(exc)) from None
+        response.headers["Cache-Control"] = "no-store"
+        # Ref names belong to the authoritative catalogue, not site reports or
+        # a moving Hub lookup. Include subfolder in the join: one commit can
+        # contain several independently registered model payloads.
+        registered: dict[tuple[str, str, str | None], dict[str, Any]] = {}
+        catalog = _service(request).model_catalog
+        if catalog is not None:
+            for definition in catalog.models.values():
+                if repo_id is not None and definition.repo_id != repo_id:
+                    continue
+                for index, snapshot in enumerate((definition, *definition.snapshots)):
+                    registered[definition.repo_id, snapshot.revision, snapshot.subfolder] = {
+                        "refs": sorted(snapshot.refs),
+                        "is_default": index == 0,
+                    }
         async with request.app.state.database.session() as session:
             rows = await request.app.state.service.repository.list_sites(session)
             return [
                 {
                     "site_id": site.id,
-                    "alias": model.alias,
+                    "repo_id": model.repo_id,
                     "revision": model.revision,
+                    "subfolder": model.subfolder or None,
                     "backend": model.backend,
                     "backend_version": model.backend_version,
                     "dtype": model.dtype,
@@ -1180,9 +1282,14 @@ def _api_router() -> APIRouter:
                     "availability": model.availability.value,
                     "gpu_uuid": model.gpu_uuid or None,
                     "verified_at": model.verified_at,
+                    **registered.get(
+                        (model.repo_id, model.revision, model.subfolder or None),
+                        {"refs": [], "is_default": False},
+                    ),
                 }
                 for site in rows
                 for model in site.models
+                if repo_id is None or model.repo_id == repo_id
             ]
 
     @router.get("/status")
@@ -1218,6 +1325,13 @@ def _api_router() -> APIRouter:
             )
         return snapshot
 
+    @router.get("/system")
+    async def system_metrics(request: Request, response: Response) -> dict[str, Any]:
+        """Cached, read-only central storage and scheduler diagnostics."""
+        _require_admin(request)
+        response.headers["Cache-Control"] = "no-store"
+        return await _service(request).system_metrics.get()
+
     @router.post("/storage/gc")
     async def storage_gc(
         request: Request,
@@ -1235,6 +1349,56 @@ def _api_router() -> APIRouter:
         _require_admin(request)
         response.headers["Cache-Control"] = "no-store"
         return await _service(request).reload_scheduling_policy()
+
+    @router.put("/policy/site-preference")
+    async def set_site_preference(
+        request: Request, response: Response, body: SitePreferenceRequest,
+    ) -> dict[str, object]:
+        _require_admin(request)
+        response.headers["Cache-Control"] = "no-store"
+        return await _service(request).set_site_preference(body)
+
+    @router.get("/upgrades")
+    async def list_upgrades(request: Request, response: Response):
+        _require_admin(request)
+        response.headers["Cache-Control"] = "no-store"
+        return [r.summary() for r in _service(request).upgrades.store.read().records]
+
+    @router.post("/upgrades", status_code=201)
+    async def schedule_upgrade(request: Request, response: Response, body: UpgradeRequest):
+        _require_admin(request)
+        response.headers["Cache-Control"] = "no-store"
+        try:
+            return await _service(request).upgrades.schedule(body)
+        except (ValueError, OSError):
+            raise HTTPException(
+                400, "upgrade plan or frozen release is unsafe/unavailable"
+            ) from None
+
+    @router.post("/upgrades/{upgrade_id}/claim")
+    async def claim_upgrade(request: Request, upgrade_id: str, body: UpgradeClaim):
+        _require_admin(request)
+        return await _service(request).upgrades.claim(upgrade_id, body)
+
+    @router.post("/upgrades/{upgrade_id}/complete")
+    async def complete_upgrade(request: Request, upgrade_id: str, body: UpgradeClaim):
+        _require_admin(request)
+        return await _service(request).upgrades.complete(upgrade_id, body)
+
+    @router.post("/upgrades/{upgrade_id}/cancel")
+    async def cancel_upgrade(request: Request, upgrade_id: str):
+        _require_admin(request)
+        return await _service(request).upgrades.cancel(upgrade_id)
+
+    @router.post("/upgrades/{upgrade_id}/recover")
+    async def recover_upgrade(request: Request, upgrade_id: str, body: UpgradeRecovery):
+        _require_admin(request)
+        return await _service(request).upgrades.recover(upgrade_id, body.action)
+
+    @router.post("/upgrades/{upgrade_id}/pause")
+    async def pause_upgrade(request: Request, upgrade_id: str, body: UpgradePauseRequest):
+        _require_admin(request)
+        return await _service(request).upgrades.pause(upgrade_id, body)
 
     @router.get("/access/users", response_model=UserListResponse)
     async def list_access_users(request: Request, response: Response) -> UserListResponse:
@@ -1302,11 +1466,17 @@ def _api_router() -> APIRouter:
     @router.post("/providers/autodl/register", status_code=202)
     async def register_manual_autodl(request: Request, registration: ManualRegistration):
         _require_admin(request)
-        controller = _service(request).provider_controller
+        service = _service(request)
+        controller = service.provider_controller
         if not isinstance(controller, ManualAutoDLController):
             raise HTTPException(status_code=409, detail="Manual SSH AutoDL is not configured")
         try:
-            return await controller.register(registration)
+            async with service._dispatch_reload_lock:
+                if service.upgrades.store.blocked(""):
+                    raise HTTPException(409, "new site installation is fenced for an upgrade")
+                return await controller.register(registration)
+        except HTTPException:
+            raise
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from None
         except Exception:
@@ -1317,11 +1487,15 @@ def _api_router() -> APIRouter:
     @router.delete("/providers/autodl/registrations/{site_id}")
     async def unregister_manual_autodl(request: Request, site_id: str):
         _require_admin(request)
-        controller = _service(request).provider_controller
+        service = _service(request)
+        controller = service.provider_controller
         if not isinstance(controller, ManualAutoDLController):
             raise HTTPException(status_code=409, detail="Manual SSH AutoDL is not configured")
         try:
-            return await controller.unregister(site_id)
+            async with service._dispatch_reload_lock:
+                if service.upgrades.store.blocked(site_id):
+                    raise HTTPException(409, "site removal is fenced for an upgrade")
+                return await controller.unregister(site_id)
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from None
 

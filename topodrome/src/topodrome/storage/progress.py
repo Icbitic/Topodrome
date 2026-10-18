@@ -1,5 +1,6 @@
 """Best-effort, thread/task-scoped storage telemetry; never a durability signal."""
 
+import time
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager, suppress
 from contextvars import ContextVar
@@ -16,11 +17,28 @@ class TransferAuthorityExpired(StorageUnavailableError):
     """Pause I/O until upload-only authority has been renewed."""
 
 
+class TransferDeadlineExpired(StorageUnavailableError):
+    """One total transfer budget expired, including reconnect/backoff time."""
+
+
 TransferObserver = Callable[[str, int, int], None]
 _observer: ContextVar[TransferObserver | None] = ContextVar("transfer_observer", default=None)
 _cancellation: ContextVar[Event | None] = ContextVar("transfer_cancellation", default=None)
 _authority: ContextVar[Callable[[], bool] | None] = ContextVar("transfer_authority", default=None)
 _reuse_verified: ContextVar[bool] = ContextVar("reuse_verified_outputs", default=False)
+_deadlines: ContextVar[tuple] = ContextVar("transfer_deadlines", default=())
+
+
+@contextmanager
+def bounded_transfer(seconds: float, *, clock=time.monotonic) -> Iterator[None]:
+    # Preserve enclosing deadlines and clocks as well as caller cancellation
+    # and publication authority. Context follows the private HTTP I/O task.
+    token = _deadlines.set((*_deadlines.get(), (clock() + seconds, clock)))
+    try:
+        check_transfer_cancelled()
+        yield
+    finally:
+        _deadlines.reset(token)
 
 
 @contextmanager
@@ -59,6 +77,8 @@ def check_transfer_cancelled() -> None:
     event = _cancellation.get()
     if event is not None and event.is_set():
         raise TransferCancelled("transfer canceled")
+    if any(clock() >= deadline for deadline, clock in _deadlines.get()):
+        raise TransferDeadlineExpired("transfer time budget expired")
     authority = _authority.get()
     if authority is not None and not authority():
         raise TransferAuthorityExpired("waiting for finalization authority")

@@ -1,0 +1,8 @@
+name: model-free-distributed
+entrypoint: gpu_compute.py
+source_dir: .
+model: null
+execution: distributed
+resources: {gpu: 2, min_vram_gb: 2, cpu: 4, memory_gb: 8}
+required_outputs: [gpu-result.json]
+retry: {max_attempts: 2}

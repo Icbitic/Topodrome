@@ -72,6 +72,10 @@ class StorageAdapter(Protocol):
 
     def resolve(self, logical_path: str) -> Path: ...
 
+    def resolve_writable(self, logical_path: str) -> Path:
+        """Return the canonical local write path, without fetching remote data."""
+        ...
+
     def flush_and_verify(
         self,
         logical_path: str,

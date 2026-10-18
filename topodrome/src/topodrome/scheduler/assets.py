@@ -594,8 +594,9 @@ class AssetCatalog:
         visibility: AssetVisibility | None = None,
         limit: int = 100,
         tags: Iterable[str] = (),
+        all_versions: bool = False,
     ) -> list[AssetSummary]:
-        """List shared assets and the requester's private assets."""
+        """List authorized assets, latest per namespace/name unless history is requested."""
 
         owner = _validate_owner(requester_username)
         if visibility is not None:
@@ -622,9 +623,14 @@ class AssetCatalog:
                     )
                 except NotFoundError:
                     continue  # A concurrent deletion may remove an enumerated ref.
-                if required_tags.issubset(asset.tags):
-                    assets.append(asset)
+                assets.append(asset)
         assets.sort(key=lambda value: (value.published_at, value.ref), reverse=True)
+        if not all_versions:
+            latest: dict[tuple[str, str], AssetSummary] = {}
+            for asset in assets:
+                latest.setdefault((asset.visibility, asset.name), asset)
+            assets = list(latest.values())
+        assets = [asset for asset in assets if required_tags.issubset(asset.tags)]
         return assets[:limit]
 
     def resolve(

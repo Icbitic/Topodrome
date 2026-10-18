@@ -31,6 +31,10 @@ def main() -> None:
         app,
         host=bind_host,
         port=arguments.port or settings.api_port,
+        # Sporadic small files must not reopen a TCP/SSH channel after the
+        # server's usual five-second idle timeout. Proxy deployments must keep
+        # their upstream idle timeout aligned with this setting.
+        timeout_keep_alive=settings.api_keepalive_seconds,
         # Uvicorn's default logging configuration installs an unfiltered,
         # non-propagating access handler after ``configure_logging``.  Keep the
         # root redacting handler so short-lived kernel query credentials never

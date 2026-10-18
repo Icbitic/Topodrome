@@ -38,7 +38,7 @@ async def test_shortest_first_paging_priority_ties_unknown_and_retry(
                 session,
                 JobSpec(
                     entrypoint="run.py",
-                    model="llama",
+                    model="test/llama",
                     name=name,
                     priority=priority,
                     estimated_runtime_seconds=estimate,
@@ -92,7 +92,7 @@ async def test_dashboard_queue_uses_same_shortest_first_order(database):
                 session,
                 JobSpec(
                     entrypoint="run.py",
-                    model="llama",
+                    model="test/llama",
                     name=name,
                     estimated_runtime_seconds=estimate,
                 ),
@@ -140,7 +140,7 @@ async def test_dispatch_selects_shorter_job_and_keeps_hint_off_worker_wire(
                 JobSpec(
                     entrypoint="experiment.py",
                     source_ref=source,
-                    model={"alias": "model", "revision": "rev"},
+                    model={"repo_id": "test/model", "revision": "rev"},
                     resources={"gpu": 1, "min_vram_gb": 15},
                     estimated_runtime_seconds=runtime,
                 )

@@ -78,7 +78,7 @@ async def running_job(database, repository):
             session,
             JobSpec(
                 entrypoint="run.py",
-                model={"alias": "llama"},
+                model={"repo_id": "test/llama"},
                 retry={"max_attempts": 1, "retry_on": [], "backoff_seconds": 0},
             ),
         )

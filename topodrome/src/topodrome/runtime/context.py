@@ -71,14 +71,30 @@ class ExperimentContext:
         checkpoint_interval_seconds: float | None = None,
         checkpoint_restore: CheckpointRestore | None = None,
         artifact_handler: Callable[[ArtifactRegistration], Any] | None = None,
+        devices: tuple[Any, ...] | None = None,
+        rank: int = 0,
+        world_size: int = 1,
+        local_rank: int = 0,
     ) -> None:
         if not job_id or not isinstance(job_id, str):
             raise ValueError("job_id must not be empty")
         if not attempt_id or not isinstance(attempt_id, str):
             raise ValueError("attempt_id must not be empty")
+        if world_size < 1 or not 0 <= rank < world_size or local_rank < 0:
+            raise ValueError("invalid distributed worker identity")
+        assigned_devices = tuple(devices) if devices is not None else (device,)
+        if not assigned_devices or device != assigned_devices[0]:
+            raise ValueError("device must be the first assigned device")
         self.model = model
         self.tokenizer = tokenizer
         self.device = device
+        self.devices = assigned_devices
+        self.rank = rank
+        self.world_size = world_size
+        # Worker-local ordinal, NOT the host's physical GPU index. Every native
+        # distributed Ray worker sees just its own GPU, so local_rank is zero.
+        self.local_rank = local_rank
+        self.is_main_process = rank == 0
         self.job_id = job_id
         self.attempt_id = attempt_id
         self.workspace = Path(workspace) if workspace is not None else None

@@ -23,7 +23,7 @@ max_parallel: 2
 job:
   name: lens-seeds
   entrypoint: run.py
-  model: meta-llama-3-8b-instruct
+  model: meta-llama/Meta-Llama-3-8B-Instruct
   resources: {gpu: 1, min_vram_gb: 20}
   kwargs: {steps: 1000}
   required_outputs: [metrics.json]
@@ -39,6 +39,104 @@ automatically. Instead of `elements`, use `indices: "0-99"` (also `0-20:2` or
 `1,3,7`). Arrays contain 1–1,000 unique nonnegative indices. Request metadata is
 bounded to 4 MiB and expanded pinned job metadata to 32 MiB. Source uploads happen
 once; immutable asset bytes are shared, not copied per element.
+
+### Checkpoint sweeps and different models
+
+An element may override `model` and resource fields. Omitted `model` inherits
+the base job; explicit `model: null` requests a model-free GPU job, not inheritance.
+A model override is a complete model address (include `repo_id`); omitted revision
+selects that repository's registered default. Resource overrides merge only the
+specified fields with the base resources. Every expanded job must independently
+satisfy GPU/parallelism and model-free VRAM requirements.
+
+```yaml
+source_dir: ./experiment
+max_parallel: 2
+job:
+  name: olmo-checkpoint-evaluation
+  entrypoint: evaluate.py
+  model: allenai/Olmo-3-1025-7B
+  resources: {gpu: 1, min_vram_gb: 16}
+  required_outputs: [metrics.json]
+elements:
+  - index: 0
+    model: {repo_id: allenai/Olmo-3-1025-7B, revision: stage1-step1000}
+  - index: 1
+    model: {repo_id: allenai/Olmo-3-1025-7B, revision: stage1-step2000}
+  - index: 2
+    model: EleutherAI/pythia-160m
+```
+
+Use `run(context, array_index, **kwargs)` and the supplied model/tokenizer. Do not
+manually download or replace model weights inside the entry point. Each selection
+is resolved to its own immutable registered commit before the array commits;
+an unknown repository/revision rejects the entire submission. Source and asset
+resolution still happen once. Retries keep the selected checkpoint, child ID,
+index and ordinary output isolation. Replaying an accepted idempotency key does
+not re-resolve moving defaults. `max_parallel` still counts children, not GPUs.
+
+For all registered checkpoints, discover once and submit once with either SDK:
+
+```python
+from topodrome.client.client import Client
+
+repo = "allenai/Olmo-3-1025-7B"
+with Client() as client:
+    snapshots = {}
+    for row in client.models(repo_id=repo):
+        snapshots.setdefault((row["revision"], row.get("subfolder")), row)
+    elements = []
+    ordered = sorted(snapshots.items(), key=lambda item: (item[0][0], item[0][1] or ""))
+    for index, ((revision, subfolder), row) in enumerate(ordered):
+        model = {"repo_id": repo, "revision": revision}
+        if subfolder is not None:
+            model["subfolder"] = subfolder
+        elements.append({"index": index, "model": model,
+                         "kwargs": {"checkpoint_refs": row["refs"]}})
+    result = client.submit_array(
+        job={"entrypoint": "evaluate.py", "model": repo,
+             "resources": {"gpu": 1, "min_vram_gb": 16},
+             "required_outputs": ["metrics.json"]},
+        elements=elements, max_parallel=2, source_dir="experiment",
+        idempotency_key="olmo-evaluation-v1",
+    )
+```
+
+The entry point should accept `checkpoint_refs` and record it in provenance.
+Execution order is not training-step order; use the full returned labels when
+analyzing results. Repeated sites/warm replicas are not additional checkpoints.
+For multiple repositories, query `client.models()` once, filter the intended
+repository IDs, and deduplicate by repository/revision/subfolder.
+
+### Reusable checkpoint workers
+
+The site may retain a compatible idle Transformers worker across children or
+ordinary jobs. Only after the next exact GPU gang is physically admitted does
+it replace weights. Compatible, local safetensors checkpoints with matching
+functional configuration/layout retain parameter storage; changed configuration,
+untracked hooks or unsupported weight layouts reconstruct the model in the same
+worker. Changed runtime/resource profiles and private/distributed/adapter workers
+use normal worker disposal instead. Any partial switch failure disposes the exact
+worker before claims can be released. The new checkpoint identity is published
+only after a successful load and CUDA synchronization. Separate child contexts,
+imports, outputs, retries, cancellation and priorities are unchanged.
+Liveness reconciliation and replacement are serialized per actor; a loading
+worker is neither advertised under its old checkpoint nor evicted as stale.
+
+For mixed-model arrays, a bounded advisory next-model hint can warm the operating
+system's reclaimable file cache while the current child computes. It reads only
+already verified local model files: no download, GPU allocation, permanent copy,
+or admission of the hinted job. The scheduler may choose another child/site, so
+prefetch is best-effort, not a promise or dependency. Site settings default to
+`checkpoint_prefetch_max_bytes: 17179869184` (16 GiB per checkpoint),
+`checkpoint_prefetch_concurrency: 1` (site-wide), and
+`checkpoint_prefetch_memory_floor_bytes: 17179869184` (16 GiB available RAM).
+Zero maximum bytes disables read-ahead. Readers have an 8-MiB application buffer
+and a 120-second cooperative deadline; the OS decides page-cache residency.
+
+Keep all useful analyses of one checkpoint in its child and batch model calls.
+Worker reuse avoids repeated process/CUDA setup, not the need to read distinct
+weights. It does not bypass physical GPU safety, queue ordering, or fairness.
 
 All children and input pins commit atomically. Use a stable idempotency key for
 uncertain submission retries; the CLI prints its generated key when omitted.
@@ -85,7 +183,7 @@ from topodrome.client.client import Client
 from topodrome.domain.arrays import JobArraySpec
 
 spec = JobArraySpec(
-    job={"entrypoint": "run.py", "model": "meta-llama-3-8b-instruct",
+    job={"entrypoint": "run.py", "model": "meta-llama/Meta-Llama-3-8B-Instruct",
          "resources": {"gpu": 1, "min_vram_gb": 20}},
     elements=[{"index": i, "kwargs": {"seed": 40 + i}} for i in range(10)],
     max_parallel=2,

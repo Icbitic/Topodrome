@@ -59,7 +59,7 @@ def _snapshot() -> dict[str, Any]:
                 "state": "running",
                 "site_id": "lab1",
                 "gpu_count": 2,
-                "model": "meta-llama-3-8b-instruct",
+                "model": "meta-llama/Meta-Llama-3-8B-Instruct",
             }
         ],
         "kernels": [
@@ -98,7 +98,7 @@ def test_dashboard_renders_consistent_system_snapshot_without_ansi() -> None:
     assert "42C" in rendered
     assert "leased" in rendered
     assert "foreign" in rendered
-    assert "meta-llama-3-8b-instruct" in rendered
+    assert "meta-llama/Meta-Llama-3-8B-Instruct" in rendered
     assert "topodrome-worker" in rendered
     assert "2/1!" in rendered
     assert "\x1b" not in rendered
@@ -396,7 +396,7 @@ def _crowded_snapshot() -> dict[str, Any]:
             "state": "succeeded",
             "site_id": "lab1",
             "gpu_count": 1,
-            "model": "model",
+            "model": "test/model",
         }
         for index in range(12)
     ]

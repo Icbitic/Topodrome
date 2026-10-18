@@ -373,20 +373,20 @@ def test_cache_pins_protect_shared_payload_and_never_evict_authoritative_storage
 
 
 def test_upload_retry_verifies_existing_remote_bytes_instead_of_copying_again(tmp_path):
-    from tests.unit.test_storage_rclone_mirror import FakeRclone, _storage
+    from tests.unit.test_storage_http_mirror import FakeAuthority, _storage
     from topodrome.storage.progress import reuse_verified_outputs
 
-    remote = FakeRclone()
+    remote = FakeAuthority()
     storage = _storage(tmp_path, remote)
     target = storage.resolve("jobs/a/attempts/b/committed/result")
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_bytes(b"completed result")
     storage.flush_and_verify("jobs/a/attempts/b/committed/result")
-    commands = len(remote.commands)
+    commands = len(remote.calls)
     with reuse_verified_outputs():
         verified = storage.flush_and_verify("jobs/a/attempts/b/committed/result")
     assert verified.digest.sha256 == hashlib.sha256(b"completed result").hexdigest()
-    assert not any("copyto" in command for command in remote.commands[commands:])
+    assert not any(command[0] == "write" for command in remote.calls[commands:])
 
 
 @pytest.mark.asyncio

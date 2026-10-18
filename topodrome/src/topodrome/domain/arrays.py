@@ -2,14 +2,28 @@
 
 from typing import Any
 
-from pydantic import Field, model_validator
+from pydantic import Field, model_serializer, model_validator
 
-from .specs import JobSpec, StrictModel
+from .specs import JobSpec, ModelRequirement, ResourceRequirements, StrictModel
 
 
 class ArrayElement(StrictModel):
     index: int = Field(ge=0, le=2**31 - 1)
     kwargs: dict[str, Any] = Field(default_factory=dict)
+    model: ModelRequirement | None = None
+    resources: ResourceRequirements | None = None
+
+    @model_serializer(mode="wrap")
+    def preserve_inheritance(self, handler):
+        value = handler(self)
+        # Omission inherits; explicit model:null requests a model-free job.
+        # Preserve that distinction through both SDKs and idempotent replay.
+        for name in ("model", "resources"):
+            if name not in self.model_fields_set:
+                value.pop(name, None)
+        if self.resources is not None:
+            value["resources"] = self.resources.model_dump(mode="json", exclude_unset=True)
+        return value
 
 
 class JobArraySpec(StrictModel):
@@ -34,6 +48,12 @@ class JobArraySpec(StrictModel):
 
     def element_spec(self, element: ArrayElement) -> JobSpec:
         value = self.job.model_dump()
+        if "model" in element.model_fields_set:
+            value["model"] = element.model.model_dump() if element.model is not None else None
+        if "resources" in element.model_fields_set:
+            if element.resources is None:
+                raise ValueError("element resources must be a resource mapping, not null")
+            value["resources"].update(element.resources.model_dump(exclude_unset=True))
         value["kwargs"] = {**self.job.kwargs, **element.kwargs}
         # The normal entrypoint receives array_index as a keyword argument.
         # It is immutable through retry and works with existing site agents.

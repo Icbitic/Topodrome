@@ -212,7 +212,7 @@ def _heartbeat(
     )
     models = tuple(
         ModelCapability(
-            alias="model-a",
+            repo_id="test/model-a",
             revision="rev",
             backend="transformers",
             backend_version="4.44",
@@ -268,7 +268,7 @@ async def _connect_and_publish(
 
 
 async def _running_offer(database, repository, authority, members, *, interactive=False):
-    model = {"alias": "model-a"}
+    model = {"repo_id": "test/model-a"}
     if len(members) > 1:
         model["parallelism"] = {
             "mode": "model_sharded",
@@ -483,7 +483,7 @@ async def test_offer_rechecks_reservation_after_a_stale_placement_read(
     spec = JobSpec(
         entrypoint="experiment.py",
         source_ref=f"sha256:{'d' * 64}",
-        model="model-a",
+        model="test/model-a",
         resources={"gpu": 1, "min_vram_gb": 1},
     )
     async with database.transaction() as session:
@@ -916,7 +916,7 @@ async def test_last_actor_reservation_overrides_floor_and_subsequent_demand_queu
         entrypoint="experiment.py",
         source_ref=f"sha256:{'c' * 64}",
         model={
-            "alias": "model-a",
+            "repo_id": "test/model-a",
             "revision": "rev",
             "backend": "transformers",
             "backend_version": "4.44",

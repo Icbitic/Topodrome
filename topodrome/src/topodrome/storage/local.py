@@ -12,7 +12,11 @@ from topodrome.storage.base import (
     StorageVerificationError,
     VerifiedObject,
 )
-from topodrome.storage.paths import normalize_logical_path, resolve_beneath
+from topodrome.storage.paths import (
+    normalize_logical_path,
+    resolve_beneath,
+    resolve_writable_beneath,
+)
 from topodrome.storage.progress import check_transfer_cancelled
 
 _READ_SIZE = 1024 * 1024
@@ -77,6 +81,9 @@ class LocalStorage:
 
     def resolve(self, logical_path: str) -> Path:
         return resolve_beneath(self.root, logical_path)
+
+    def resolve_writable(self, logical_path: str) -> Path:
+        return resolve_writable_beneath(self.root, logical_path)
 
     def flush_and_verify(
         self,

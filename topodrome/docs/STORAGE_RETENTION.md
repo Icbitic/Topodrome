@@ -1,6 +1,6 @@
 # Storage lifecycle
 
-Lab1 remains authoritative. rclone remains a transport, not the authority for
+Lab1 remains authoritative. HTTP remains a transport, not the authority for
 deletion. Retention policy and references decide which owned files can expire.
 See the tutorial's authoritative-storage retention section for settings and
 commands. The legacy retention rollout needed no database revision; switching
@@ -23,11 +23,29 @@ publishing an output as an asset adds a reference without another payload copy.
 Direct client uploads still send their contents before server-side deduplication.
 
 Collection preserves published assets, accepted consumers, retained artifacts,
-live leases, and pending output claims. It enumerates indexed blobs, rechecks
+live leases, active downloads, and pending output claims. It enumerates indexed blobs, rechecks
 references under the publication lock, and deletes only unreferenced objects
 past the grace period. Unknown or malformed metadata fails closed. Checkpoints
-and logs keep their separate formats and retention rules. Native and rclone
+and logs keep their separate formats and retention rules. Native and HTTP
 mirror storage use same-filesystem hardlinks for atomic local installation.
+
+## Temporary download protection
+
+The unified `download` command resolves `job://` or `asset://` members under the
+same reference lock as publication and GC. Fsynced owner-bound descriptors in
+`.topodrome-downloads/download_<id>.json` pin those exact files without publishing
+an asset or changing their ordinary retention. GC and its eligibility forecast
+exclude live download pins. Invalid pin metadata aborts collection.
+
+Pins persist across scheduler restarts, expire after 15 minutes without renewal,
+and cannot be renewed past 24 hours. Clients and active server streams renew
+every minute; clients close pins on completion/failure, and abandoned pins expire
+after process death. The next download prunes expired descriptors. Capacity is
+bounded to 16 live pins per owner / 128 overall; each admits at most 10,000 files
+and 16 MiB of metadata. No network transfer holds the storage reference lock.
+An already-open descriptor remains readable if a caller closes its pin early,
+but later member requests require a live pin. Local failed-download partials
+are outside authoritative storage and remain for explicit retry.
 
 ### Fresh-start archive (no migration)
 

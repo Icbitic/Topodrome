@@ -13,6 +13,8 @@ from pathlib import Path
 
 from pydantic import BaseModel, ConfigDict, SecretStr, field_validator
 
+from topodrome.deployment.ssh_files import upload_bytes, upload_file
+
 
 def parse_ssh(command: str) -> tuple[str, int, str]:
     """Accept connection coordinates, never arbitrary SSH options or a shell."""
@@ -125,13 +127,14 @@ async def install(record: dict, bundle: Path) -> None:
     digest = (bundle / "current").read_text().strip()
     if not re.fullmatch(r"[a-f0-9]{64}", digest):
         raise ValueError("invalid manual AutoDL release pointer")
+    if not re.fullmatch(r"autodl-manual-[a-f0-9]{24}", record["site_id"]):
+        raise ValueError("invalid manual AutoDL site identity")
     # Per-registration release pointer: never rewrite another instance's
     # shared bootstrap, secrets, model cache, or running environment.
     remote = "/root/autodl-fs/topodrome/manual/" + record["site_id"]
     async with connect(record) as c:
         await c.run(
             "test -f /root/autodl-fs/topodrome/secrets/site.env && "
-            "test -f /root/autodl-fs/topodrome/secrets/rclone.conf && "
             f"mkdir -p {remote} && chmod 700 {remote}",
             check=True,
             timeout=30,
@@ -155,14 +158,13 @@ async def install(record: dict, bundle: Path) -> None:
             r"/root/autodl-fs/topodrome/python/[A-Za-z0-9._-]+/bin/python3\.11", interpreter
         ):
             raise ValueError("unsafe regional Python path")
-        async with c.start_sftp_client() as sftp:
-            for name in (f"release-{digest}.tar.gz", f"release-{digest}.sha256", "bootstrap.sh"):
-                await sftp.put(str(bundle / name), f"{remote}/{name}.tmp")
-                await sftp.posix_rename(f"{remote}/{name}.tmp", f"{remote}/{name}")
-            await sftp.chmod(remote + "/bootstrap.sh", 0o700)
-            async with sftp.open(remote + "/current.tmp", "w") as stream:
-                await stream.write(digest + "\n")
-            await sftp.posix_rename(remote + "/current.tmp", remote + "/current")
+        for name in (f"release-{digest}.tar.gz", f"release-{digest}.sha256", "bootstrap.sh"):
+            await upload_file(
+                c, bundle / name, remote, name, mode=0o700 if name.endswith(".sh") else 0o600
+            )
+        # The release pointer is committed last, after every immutable member
+        # is verified and durable. An interrupted install leaves the old release.
+        await upload_bytes(c, (digest + "\n").encode(), remote, "current")
         # Install ownership marker before launching. Shutdown rechecks it along
         # with the pinned host key and container hostname, not just an SSH port.
         marker = shlex.quote(record["identity"])

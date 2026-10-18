@@ -21,7 +21,7 @@ def _job(source_ref: str | None = None) -> JobSpec:
     return JobSpec(
         entrypoint="experiment.py",
         source_ref=source_ref,
-        model="meta-llama-3-8b-instruct",
+        model="meta-llama/Meta-Llama-3-8B-Instruct",
         resources={"gpu": 1, "min_vram_gb": 15},
     )
 
@@ -311,7 +311,7 @@ def test_source_dir_cannot_silently_replace_an_existing_source_ref(tmp_path: Pat
     client = Client(transport=httpx.MockTransport(lambda _request: pytest.fail("network used")))
 
     with pytest.raises(ValueError, match="source_dir or source_ref"):
-        client.submit(_job("sha256:existing"), source_dir=tmp_path)
+        client.submit(_job("test/sha256:existing"), source_dir=tmp_path)
     client.close()
 
 

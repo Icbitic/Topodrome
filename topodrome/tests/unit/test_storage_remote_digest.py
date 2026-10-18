@@ -112,14 +112,14 @@ def test_reader_fails_closed(code, payload):
 
 @pytest.mark.parametrize("corrupt", [False, True])
 def test_artifact_commit_verifies_on_authority_without_readback(tmp_path, corrupt):
-    from tests.unit.test_storage_rclone_mirror import FakeRclone
+    from tests.unit.test_storage_http_mirror import FakeAuthority
     from topodrome.storage import (
         AttemptArtifactStore,
-        RcloneMirrorStorage,
+        HttpMirrorStorage,
         StorageVerificationError,
     )
 
-    remote = FakeRclone()
+    remote = FakeAuthority()
     requests = []
     authority = tmp_path / "lab1"
     authority.mkdir()
@@ -128,6 +128,8 @@ def test_artifact_commit_verifies_on_authority_without_readback(tmp_path, corrup
         requests.append(request)
         assert request.method == "POST" and len(request.content) < 512
         logical = json.loads(request.content)["logical_path"]
+        if logical not in remote.objects:
+            return httpx.Response(404)
         stored = authority / logical
         stored.parent.mkdir(parents=True, exist_ok=True)
         stored.write_bytes(remote.objects[logical] + (b"corrupt" if corrupt else b""))
@@ -140,11 +142,10 @@ def test_artifact_commit_verifies_on_authority_without_readback(tmp_path, corrup
         health_reader=remote,
         transport=httpx.MockTransport(digest_request),
     )
-    mirror = RcloneMirrorStorage(
+    mirror = HttpMirrorStorage(
         tmp_path / "worker",
         remote.remote_root,
-        binary="true",
-        run=remote,
+        bulk_transport=remote,
         authoritative_reader=reader,
         min_free_space_gb=0.001,
         verification_timeout_seconds=0.01,
@@ -161,4 +162,4 @@ def test_artifact_commit_verifies_on_authority_without_readback(tmp_path, corrup
         assert manifest.artifact("result.bin").size_bytes == 70000
         assert store.published_manifest_path in remote.objects
     assert requests
-    assert all(command[1] not in {"cat", "hashsum"} for command in remote.commands)
+    assert not remote.reads

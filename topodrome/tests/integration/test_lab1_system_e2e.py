@@ -266,7 +266,7 @@ def _write_configuration(
         yaml.safe_dump(
             {
                 "models": {
-                    "meta-llama-3-8b-instruct": {
+                    "meta-llama/Meta-Llama-3-8B-Instruct": {
                         "revision": _REVISION,
                         "backend": "transformers",
                         "backend_version": "4.57.6",
@@ -376,7 +376,7 @@ def _job(
     selected_gpu_uuids: tuple[str, ...],
     model_sharded: bool,
 ) -> JobSpec:
-    model: str | dict[str, Any] = "meta-llama-3-8b-instruct"
+    model: str | dict[str, Any] = "meta-llama/Meta-Llama-3-8B-Instruct"
     resources: dict[str, int] = {
         "gpu": 1,
         "min_vram_gb": 15,
@@ -385,7 +385,7 @@ def _job(
     }
     if model_sharded:
         model = {
-            "alias": "meta-llama-3-8b-instruct",
+            "repo_id": "meta-llama/Meta-Llama-3-8B-Instruct",
             "parallelism": {
                 "mode": "model_sharded",
                 "degree": 2,
@@ -528,7 +528,7 @@ def test_lab1_scheduler_agent_python_and_cli_reuse_one_real_llama_actor(
                     assert reported_gpu_uuids == set(gpu_uuids)
                     first = client.submit(
                         _job(
-                            "python-sdk",
+                            "test/python-sdk",
                             selected_gpu_uuids=gpu_uuids,
                             model_sharded=model_sharded,
                         ),
@@ -573,7 +573,7 @@ def test_lab1_scheduler_agent_python_and_cli_reuse_one_real_llama_actor(
                         {
                             "source_dir": "source",
                             **_job(
-                                "cli",
+                                "test/cli",
                                 selected_gpu_uuids=gpu_uuids,
                                 model_sharded=model_sharded,
                             ).model_dump(mode="json", exclude={"source_ref"}),

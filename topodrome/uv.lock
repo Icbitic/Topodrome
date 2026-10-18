@@ -3089,6 +3089,7 @@ dependencies = [
 [package.optional-dependencies]
 agent = [
     { name = "aiosqlite" },
+    { name = "asyncssh" },
     { name = "nvidia-ml-py" },
     { name = "psutil" },
     { name = "websockets" },
@@ -3154,6 +3155,7 @@ requires-dist = [
     { name = "alembic", marker = "extra == 'scheduler'", specifier = ">=1.14" },
     { name = "anyio", specifier = ">=4.8" },
     { name = "asyncpg", marker = "extra == 'scheduler'", specifier = ">=0.30" },
+    { name = "asyncssh", marker = "extra == 'agent'", specifier = ">=2.21,<3" },
     { name = "fastapi", marker = "extra == 'scheduler'", specifier = ">=0.115" },
     { name = "httpx", specifier = ">=0.28" },
     { name = "ipykernel", marker = "extra == 'jupyter'", specifier = ">=6.29" },

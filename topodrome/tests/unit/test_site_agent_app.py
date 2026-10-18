@@ -25,7 +25,6 @@ from topodrome.site_agent.app import (
     build_application,
 )
 from topodrome.site_agent.inventory import GPUReservationLockReader
-from topodrome.storage import RcloneMirrorStorage, RcloneMountStorage
 
 pytestmark = pytest.mark.unit
 
@@ -119,7 +118,7 @@ def test_model_registry_verifies_payload_before_advertising_cached(tmp_path: Pat
         yaml.safe_dump(
             {
                 "models": {
-                    "model": {
+                    "test/model": {
                         "revision": revision,
                         "backend": "transformers",
                         "backend_version": importlib.metadata.version("transformers"),
@@ -165,7 +164,7 @@ def test_model_registry_passes_preseeded_hash_policy_only_to_startup_verificatio
         yaml.safe_dump(
             {
                 "models": {
-                    "model": {
+                    "test/model": {
                         "revision": revision,
                         "backend_version": importlib.metadata.version("transformers"),
                         "sites": {"test-site": {"path": str(model)}},
@@ -204,7 +203,7 @@ def test_model_acquisition_targets_persistent_storage_not_ephemeral_copy(
         yaml.safe_dump(
             {
                 "models": {
-                    "model": {
+                    "test/model": {
                         "revision": revision,
                         "backend": "transformers",
                         "backend_version": importlib.metadata.version("transformers"),
@@ -245,7 +244,7 @@ def test_persistent_model_is_atomically_staged_to_configured_local_ssd(
         yaml.safe_dump(
             {
                 "models": {
-                    "model": {
+                    "test/model": {
                         "revision": revision,
                         "backend": "transformers",
                         "backend_version": importlib.metadata.version("transformers"),
@@ -281,7 +280,7 @@ def test_unverified_model_without_origin_fails_closed(tmp_path: Path) -> None:
         yaml.safe_dump(
             {
                 "models": {
-                    "model": {
+                    "test/model": {
                         "revision": "c" * 40,
                         "backend_version": importlib.metadata.version("transformers"),
                         "sites": {"test-site": {"path": str(model)}},
@@ -312,7 +311,7 @@ def test_read_only_preseeded_model_uses_operator_revision_manifest(
         yaml.safe_dump(
             {
                 "models": {
-                    "model": {
+                    "test/model": {
                         "revision": revision,
                         "backend_version": importlib.metadata.version("transformers"),
                         "sites": {
@@ -336,62 +335,43 @@ def test_read_only_preseeded_model_uses_operator_revision_manifest(
     assert registry.get(capability.key).payload_identity is not None
 
 
-def test_storage_wires_configured_rclone_supervisor(tmp_path: Path) -> None:
-    binary = tmp_path / "rclone"
-    binary.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
-    binary.chmod(0o700)
+def test_storage_wires_http_only_without_external_executables(tmp_path: Path) -> None:
+    from topodrome.storage.http_mirror import HttpMirrorStorage
+    from topodrome.storage.http_transport import SchedulerFileTransport
+
     settings = _settings(
         tmp_path,
-        rclone={
-            "mountpoint": tmp_path / "global",
-            "remote": "lab1:topodrome",
-            "cache_dir": tmp_path / "cache",
-            "binary": str(binary),
-            "vfs_cache_max_size_gb": 7,
+        enrollment_token="synthetic",  # noqa: S106 -- synthetic fixture
+        storage={
+            "authority_id": "lab1-global:",
+            "small_file_max_bytes": 4096,
             "min_free_space_gb": 3,
-            "write_back_seconds": 9,
-            "poll_interval_seconds": 11,
-            "startup_timeout_seconds": 13,
-        },
-    )
-
-    storage, supervisor = _storage(settings)
-
-    assert isinstance(storage, RcloneMountStorage)
-    assert supervisor is not None
-    assert supervisor.command[supervisor.command.index("--vfs-cache-max-size") + 1] == "7G"
-    assert supervisor.command[supervisor.command.index("--vfs-cache-min-free-space") + 1] == "3G"
-    assert supervisor.command[supervisor.command.index("--vfs-write-back") + 1] == "9s"
-    assert supervisor.command[supervisor.command.index("--poll-interval") + 1] == "11s"
-
-
-def test_storage_wires_no_fuse_rclone_mirror(tmp_path: Path) -> None:
-    binary = tmp_path / "rclone"
-    binary.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
-    binary.chmod(0o700)
-    settings = _settings(
-        tmp_path,
-        rclone={
-            "mode": "mirror",
-            "mountpoint": tmp_path / "global",
-            "remote": "lab1-global:",
-            "cache_dir": tmp_path / "unused-vfs-cache",
-            "binary": str(binary),
-            "min_free_space_gb": 3,
-            "poll_interval_seconds": 7,
             "verification_timeout_seconds": 19,
         },
     )
+    storage = _storage(settings)
+    try:
+        assert isinstance(storage, HttpMirrorStorage)
+        assert isinstance(storage._bulk, SchedulerFileTransport)
+        assert storage._reader is storage._bulk
+        assert storage._small_files.max_bytes == 4096
+        assert storage.root == (tmp_path / "global").resolve()
+        assert storage.remote_root == "lab1-global:"
+    finally:
+        storage.close()
+    assert storage._small_files._client.is_closed
+    assert storage._bulk._client.is_closed
+    assert storage._bulk._bulk.is_closed
+    assert storage._bulk._uploads._client.is_closed
+    settings.storage.small_file_max_bytes = 0
+    storage = _storage(settings)
+    try:
+        assert storage._small_files is None
+    finally:
+        storage.close()
 
-    storage, supervisor = _storage(settings)
 
-    assert isinstance(storage, RcloneMirrorStorage)
-    assert storage.root == (tmp_path / "global").resolve()
-    assert storage.remote_root == "lab1-global:"
-    assert supervisor is None
-
-
-async def test_application_stops_only_its_storage_supervisor() -> None:
+async def test_application_closes_only_its_owned_storage() -> None:
     closed: list[str] = []
 
     class Agent:
@@ -408,21 +388,21 @@ async def test_application_stops_only_its_storage_supervisor() -> None:
         def close(self) -> None:
             closed.append(self.name)
 
-    class Mount:
-        def stop(self) -> None:
-            closed.append("mount")
+    class Storage:
+        def close(self) -> None:
+            closed.append("storage")
 
     application = AgentApplication(
         agent=Agent(),  # type: ignore[arg-type]
         inventory=Resource("inventory"),  # type: ignore[arg-type]
         fences=Resource("fences"),  # type: ignore[arg-type]
         spool=Resource("spool"),  # type: ignore[arg-type]
-        storage_mount=Mount(),  # type: ignore[arg-type]
+        storage_close=Storage().close,
     )
 
     await application.run()
 
-    assert closed == ["ran", "inventory", "fences", "spool", "mount"]
+    assert closed == ["ran", "inventory", "fences", "spool", "storage"]
 
 
 async def test_application_configures_ray_signals_and_coalesces_repeated_sigterm(
@@ -515,6 +495,61 @@ async def test_application_owns_control_tunnel_for_exact_agent_lifetime() -> Non
     ]
 
 
+async def test_slow_bulk_maintenance_cannot_block_control_supervision(monkeypatch):
+    import threading
+
+    started, release = threading.Event(), threading.Event()
+    ready = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    control_ticks = []
+    original_wait = asyncio.wait_for
+
+    async def quick_wait(awaitable, timeout):  # noqa: ASYNC109 -- matching asyncio API for test clock
+        return await original_wait(awaitable, 0.01 if timeout == 5 else timeout)
+
+    monkeypatch.setattr(site_agent_app.asyncio, "wait_for", quick_wait)
+
+    def maintenance():
+        started.set()
+        assert release.wait(3)
+
+    class Agent:
+        async def run(self):
+            try:
+                async with asyncio.timeout(2):
+                    await ready.wait()
+            finally:
+                release.set()
+
+        async def shutdown(self, *, stop_ray):
+            pytest.fail("bulk maintenance must not restart computation")
+
+    class Resource:
+        def close(self):
+            pass
+
+    class Tunnel:
+        def ensure_running(self):
+            control_ticks.append(True)
+            if started.is_set() and len(control_ticks) >= 4:
+                loop.call_soon_threadsafe(ready.set)
+
+        def stop(self):
+            pass
+
+    resource = Resource()
+    application = AgentApplication(
+        agent=Agent(),
+        inventory=resource,
+        fences=resource,
+        spool=resource,
+        control_tunnel=Tunnel(),
+        storage_maintenance=maintenance,
+    )
+    await application.run()
+    assert started.is_set() and len(control_ticks) >= 4
+
+
 async def test_abnormal_application_exit_stops_runtime_before_local_cleanup() -> None:
     events: list[str] = []
 
@@ -534,16 +569,16 @@ async def test_abnormal_application_exit_stops_runtime_before_local_cleanup() ->
         def close(self) -> None:
             events.append(self.name)
 
-    class Mount:
-        def stop(self) -> None:
-            events.append("mount")
+    class Storage:
+        def close(self) -> None:
+            events.append("storage")
 
     application = AgentApplication(
         agent=Agent(),  # type: ignore[arg-type]
         inventory=Resource("inventory"),  # type: ignore[arg-type]
         fences=Resource("fences"),  # type: ignore[arg-type]
         spool=Resource("spool"),  # type: ignore[arg-type]
-        storage_mount=Mount(),  # type: ignore[arg-type]
+        storage_close=Storage().close,
     )
 
     with pytest.raises(RuntimeError, match="background failure"):
@@ -555,11 +590,11 @@ async def test_abnormal_application_exit_stops_runtime_before_local_cleanup() ->
         "inventory",
         "fences",
         "spool",
-        "mount",
+        "storage",
     ]
 
 
-def test_partial_application_build_rolls_back_started_mount_and_inventory(
+def test_partial_application_build_rolls_back_storage_and_inventory(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -577,22 +612,23 @@ def test_partial_application_build_rolls_back_started_mount_and_inventory(
         def healthcheck(self) -> bool:
             return True
 
-    class Mount:
-        def start(self) -> None:
-            events.append("mount-start")
+        def resolve(self, logical):
+            return tmp_path / "global" / logical
 
-        def stop(self) -> None:
-            events.append("mount-stop")
+        def resolve_writable(self, logical):
+            return tmp_path / "global" / logical
+
+        def close(self):
+            events.append("storage-close")
 
     inventory = Inventory()
-    mount = Mount()
 
     def inventory_factory(*_args: object, **options: object) -> Inventory:
         inventory_options.update(options)
         return inventory
 
     monkeypatch.setattr(site_agent_app, "NVMLInventoryProvider", inventory_factory)
-    monkeypatch.setattr(site_agent_app, "_storage", lambda _settings: (Storage(), mount))
+    monkeypatch.setattr(site_agent_app, "_storage", lambda _settings: Storage())
     monkeypatch.setattr(
         site_agent_app,
         "_model_registry",
@@ -608,7 +644,7 @@ def test_partial_application_build_rolls_back_started_mount_and_inventory(
     with pytest.raises(RuntimeError, match="injected build failure"):
         build_application(settings)
 
-    assert events == ["mount-start", "mount-stop", "inventory-close"]
+    assert events == ["storage-close", "inventory-close"]
     assert isinstance(
         inventory_options["reservation_detector"],
         GPUReservationLockReader,

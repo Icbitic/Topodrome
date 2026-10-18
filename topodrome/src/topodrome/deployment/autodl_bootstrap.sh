@@ -3,7 +3,7 @@ set -eu
 
 # This script is copied to persistent AutoDL storage by
 # topodrome-build-autodl-bootstrap. It never contains credentials. The protected
-# environment and rclone configuration remain separate from the release bundle.
+# environment remains separate from the release bundle. Storage uses HTTP only.
 umask 077
 
 fail() {
@@ -31,7 +31,6 @@ if [ "${1:-}" != "--topodrome-sanitized-bootstrap" ]; then
     TOPODROME_AUTODL_ARTIFACT_ROOT="${TOPODROME_AUTODL_ARTIFACT_ROOT:-}" \
     TOPODROME_AUTODL_MANUAL_SITE_ID="${TOPODROME_AUTODL_MANUAL_SITE_ID:-}" \
     TOPODROME_SITE_SECRET_FILE="${TOPODROME_SITE_SECRET_FILE:-}" \
-    TOPODROME_BOOTSTRAP_RCLONE_CONFIG="${TOPODROME_BOOTSTRAP_RCLONE_CONFIG:-}" \
     TOPODROME_AUTODL_PYTHON="${TOPODROME_AUTODL_PYTHON:-}" \
     AutoDLContainerUUID="${AutoDLContainerUUID:-}" \
     AutoDLDataCenter="${AutoDLDataCenter:-}" \
@@ -66,7 +65,6 @@ persistent_root="${TOPODROME_AUTODL_PERSISTENT_ROOT:-/root/autodl-fs/topodrome}"
 ephemeral_root="${TOPODROME_AUTODL_EPHEMERAL_ROOT:-/root/autodl-tmp/topodrome}"
 artifact_root="${TOPODROME_AUTODL_ARTIFACT_ROOT:-$persistent_root/bootstrap}"
 secret_file="${TOPODROME_SITE_SECRET_FILE:-$persistent_root/secrets/site.env}"
-bootstrap_rclone_config="${TOPODROME_BOOTSTRAP_RCLONE_CONFIG:-$persistent_root/secrets/rclone.conf}"
 
 # AutoDL exposes provider-owned, non-secret container identity metadata.  Keep
 # it through the otherwise empty bootstrap environment, normalize the optional
@@ -210,8 +208,6 @@ PY
 # credential-bearing site environment until release verification and dependency
 # installation are complete.
 check_private_file "$secret_file" || fail "site secret file failed its permission check"
-check_private_file "$bootstrap_rclone_config" \
-  || fail "bootstrap rclone configuration failed its permission check"
 
 pointer="$artifact_root/current"
 [ -f "$pointer" ] && [ ! -L "$pointer" ] || fail "release pointer is unavailable"
@@ -325,17 +321,7 @@ run_uv_for() {
     "$release_root/tools/uv" "$@"
 }
 
-run_bootstrap_rclone() {
-  /usr/bin/env -i \
-    HOME="$bootstrap_home" \
-    LANG=C.UTF-8 \
-    PATH="$runtime_path" \
-    RCLONE_CONFIG="$bootstrap_rclone_config" \
-    "$release_root/tools/rclone" "$@"
-}
-
 run_uv_for "$UV_PROJECT_ENVIRONMENT" --version >/dev/null
-run_bootstrap_rclone version >/dev/null
 cd "$release_root"
 
 bootstrap_plan="$(
@@ -384,7 +370,7 @@ if (
     seed.get("format") != "site-packages-tar-gz"
     or seed.get("uv_lock_sha256") != lock_digest
     or not isinstance(remote, str)
-    or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]*:[A-Za-z0-9][A-Za-z0-9._/-]*", remote)
+    or not re.fullmatch(r"(?:[A-Za-z0-9][A-Za-z0-9_-]*:)?[A-Za-z0-9][A-Za-z0-9._/-]*", remote)
     or not isinstance(digest, str)
     or not re.fullmatch(r"[0-9a-f]{64}", digest)
     or not isinstance(platform_key, str)
@@ -608,7 +594,11 @@ fetch_runtime_seed() {
   if [ -f "$seed_cached" ] && [ ! -L "$seed_cached" ]; then
     cp --reflink=auto -- "$seed_cached" "$seed_archive"
   else
-    run_bootstrap_rclone copyto "$seed_remote" "$seed_archive" >/dev/null 2>&1
+    /usr/bin/env -i HOME="$bootstrap_home" LANG=C.UTF-8 PATH="$runtime_path" \
+      TOPODROME_AUTODL_MANUAL_SITE_ID="${TOPODROME_AUTODL_MANUAL_SITE_ID:-}" \
+      "$bootstrap_python" "$release_root/src/topodrome/deployment/bootstrap_http.py" \
+      --manifest "$release_root/bundle-manifest.json" --secrets "$secret_file" \
+      --output "$seed_archive" --cache "$seed_cached"
   fi
 }
 
@@ -670,7 +660,10 @@ PY
     [ "$seed_mode" != "legacy" ] \
       || fail "legacy runtime seed may only reuse an already reconciled uv environment"
     seed_archive="$(mktemp "$TMPDIR/runtime-seed.XXXXXXXX.tar.gz")"
-    if ! fetch_runtime_seed; then
+    fetch_status=0
+    fetch_runtime_seed || fetch_status=$?
+    if [ "$fetch_status" -ne 0 ]; then
+      [ "$fetch_status" -ne 65 ] || fail "runtime seed failed size or SHA-256 verification"
       rm -f -- "$seed_archive"
       seed_archive=""
       if [ "$allow_online_fallback" -eq 1 ]; then
@@ -895,18 +888,16 @@ fi
   || fail "uv environment has no Ray executable"
 
 # Only the long-lived site agent receives site/model credentials. Neither uv,
-# archive helpers, nor the bootstrap rclone process above inherit them.
+# archive helpers receive them. The seed helper reads only enrollment in-process.
 set -a
 # shellcheck disable=SC1090 -- the path was permission-checked above.
 . "$secret_file"
 set +a
 : "${TOPODROME_SITE_ENROLLMENT_TOKEN:?site secret file lacks enrollment identity}"
 : "${TOPODROME_SITE_FENCE_VERIFICATION_KEY:?site secret file lacks fence verification key}"
-: "${RCLONE_CONFIG:?site secret file lacks RCLONE_CONFIG}"
 if [ -z "${TOPODROME_HF_TOKEN:-${HF_TOKEN:-}}" ]; then
   fail "site secret file lacks the Hugging Face acquisition credential"
 fi
-check_private_file "$RCLONE_CONFIG" || fail "rclone configuration failed its permission check"
 
 if [ -n "$provider_instance_id" ]; then
   TOPODROME_SITE_PROVIDER_INSTANCE_ID="$provider_instance_id"
@@ -925,7 +916,7 @@ export UV_CACHE_DIR UV_PROJECT_ENVIRONMENT UV_PYTHON_INSTALL_DIR XDG_CACHE_HOME 
 export UV_NO_PROGRESS=1
 trap - EXIT HUP INT TERM
 
-# The foreground site agent owns the authenticated outbound connection, rclone
-# mount, local Ray lifecycle, and clean signal handling. No credential appears in
+# The foreground site agent owns independent control/bulk SSH forwards, the HTTP
+# mirror, local Ray lifecycle, and clean signal handling. No credential appears in
 # its arguments; worker environments are separately allowlisted by Topodrome.
 exec "$UV_PROJECT_ENVIRONMENT/bin/topodrome-agent" --config "$release_root/config/site.yaml"

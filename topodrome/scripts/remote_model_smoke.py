@@ -165,7 +165,7 @@ def main() -> int:
     _STAGE = "physical_gpu_inventory"
     gpus = _select_gpus(args)
     key = ModelKey(
-        alias="meta-llama-3-8b-instruct",
+        repo_id="meta-llama/Meta-Llama-3-8B-Instruct",
         revision="8afb486c1db24fe5011ec46dfbe5b5dccdb575c2",
         backend="transformers",
         backend_version="4.57.6",
